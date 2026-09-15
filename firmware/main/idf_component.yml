@@ -1,6 +1,11 @@
-# Managed component dependencies (fetched by idf.py from the ESP Component
-# Registry during build).
+# Component manifest.
+#
+# Only the ESP-IDF version constraint is declared here. All other dependencies
+# are built-in components and are listed under REQUIRES in CMakeLists.txt.
+#
+# v0.1 additionally declared `mqtt: ~2.0.0` here, i.e. a *managed* component
+# fetched from the registry, while the sources `#include "mqtt_client.h"` from
+# the built-in esp-mqtt. That is two conflicting dependency mechanisms for one
+# component and no way to tell which one wins.
 dependencies:
-  idf: ">=5.0"
-  mqtt:
-    version: "~2.0.0"
+  idf: ">=5.2"

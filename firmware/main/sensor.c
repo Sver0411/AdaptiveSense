@@ -1,255 +1,328 @@
 /*
  * sensor.c — BME280 (I2C) driver + optional mock sensor.
  *
- * The BME280 part is a compact register-level driver: it reads the chip's
- * calibration constants at init and compensates raw sensor registers per the
- * BME280 datasheet equations. If CONFIG_AS_USE_MOCK_SENSOR is set, a
- * deterministic mock is substituted instead (never presented as real data).
+ * Transport only: register access, chip bring-up, the forced-mode measurement
+ * sequence, and mapping the compensated values into a `sensor_read_t`. All
+ * calibration parsing and compensation maths live in `bme280_math.c`, which has
+ * no ESP-IDF dependency and is unit-tested on the host.
+ *
+ * Measurement model — FORCED MODE (see docs/hardware.md and the README):
+ *
+ *   wake -> trigger one BME280 conversion -> wait for it (bounded) -> read ->
+ *   evaluate -> sleep
+ *
+ * The sensor is never left converting while the MCU sleeps, and it is never in
+ * normal mode continuously sampling in the background. `ctrl_meas` bits [1:0]
+ * are therefore always written with 0b01 (forced). v0.1 wrote 0b01 while its
+ * comment claimed normal mode, and never re-triggered a conversion, so every
+ * read after the first returned stale registers.
+ *
+ * Uses the current ESP-IDF I2C master driver (`driver/i2c_master.h`); the legacy
+ * `driver/i2c.h` API is deprecated from ESP-IDF v5.2 onwards.
  */
 #include <math.h>
 #include <string.h>
 
-#include "driver/gpio.h"
-#include "driver/i2c.h"
+#include "esp_err.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include "sensor.h"
+#include "driver/i2c_master.h"
+
+#include "bme280_math.h"
 #include "config.h"
+#include "sensor.h"
 
 static const char *TAG = "sensor";
-
-#if CONFIG_AS_USE_MOCK_SENSOR
 
 /* ------------------------------------------------------------------ */
 /* Mock sensor: reproducible synthetic sequence (documented in README). */
 /* ------------------------------------------------------------------ */
+#if CONFIG_AS_USE_MOCK_SENSOR
 static void mock_fill(sensor_read_t *out)
 {
     static uint32_t step = 0;
-    float t = 24.0f + 0.08f * sinf((float)step * 0.1f);
-    float h = 45.0f + 0.4f * sinf((float)step * 0.07f);
-    for (int i = 0; i < SEN_CH_COUNT; i++) out->valid[i] = true;
+    const float t = 24.0f + 0.08f * sinf((float)step * 0.1f);
+    const float h = 45.0f + 0.4f * sinf((float)step * 0.07f);
+    for (int i = 0; i < SEN_CH_COUNT; i++) {
+        out->valid[i] = true;
+    }
     out->value[SEN_CH_TEMPERATURE] = t;
     out->value[SEN_CH_HUMIDITY] = h;
     out->value[SEN_CH_PRESSURE] = 1012.4f;
     out->value[SEN_CH_LIGHT] = 320.0f + 3.0f * sinf((float)step * 0.02f);
     step++;
 }
-
-#endif /* MOCK */
+#endif /* CONFIG_AS_USE_MOCK_SENSOR */
 
 /* ------------------------------------------------------------------ */
 /* BME280 registers                                                    */
 /* ------------------------------------------------------------------ */
-#define BME280_ID_REG         0xD0
-#define BME280_RESET_REG      0xE0
-#define BME280_CTRL_HUM       0xF2
-#define BME280_STATUS         0xF3
-#define BME280_CTRL_MEAS      0xF4
-#define BME280_CONFIG         0xF5
-#define BME280_PRESS_DATA     0xF7
-#define BME280_CHIPID         0x60
-#define BME280_RESET_CMD      0xB6
+#define BME280_REG_ID        0xD0u
+#define BME280_REG_RESET     0xE0u
+#define BME280_REG_CTRL_HUM  0xF2u
+#define BME280_REG_STATUS    0xF3u
+#define BME280_REG_CTRL_MEAS 0xF4u
+#define BME280_REG_CONFIG    0xF5u
+#define BME280_REG_DATA      0xF7u  /* 0xF7..0xFE, 8 bytes */
 
-typedef struct {
-    uint16_t dig_T1; int16_t dig_T2, dig_T3;
-    uint16_t dig_P1; int16_t dig_P2, dig_P3, dig_P4, dig_P5, dig_P6, dig_P7, dig_P8, dig_P9;
-    uint8_t  dig_H1; int16_t dig_H2; uint8_t dig_H3;
-    int16_t  dig_H4, dig_H5; int8_t dig_H6;
-    int32_t  t_fine;
-} bme280_cal_t;
+#define BME280_CHIP_ID       0x60u
+#define BME280_RESET_CMD     0xB6u
 
-static bme280_cal_t bme_cal;
-static uint8_t i2c_addr = CONFIG_AS_BME280_I2C_ADDR;
+#define BME280_STATUS_MEASURING 0x08u  /* status bit 3 */
 
-static esp_err_t bme_write(uint8_t reg, uint8_t data)
+/* Oversampling x1 for temperature, pressure and humidity (osrs_* = 001). */
+#define BME280_OSRS_T 0x01u
+#define BME280_OSRS_P 0x01u
+#define BME280_OSRS_H 0x01u
+
+/* ctrl_meas: osrs_t[7:5] | osrs_p[4:2] | mode[1:0]; mode 0b01 = forced. */
+#define BME280_MODE_FORCED 0x01u
+#define BME280_CTRL_MEAS_VALUE \
+    ((uint8_t)((BME280_OSRS_T << 5) | (BME280_OSRS_P << 2) | BME280_MODE_FORCED))
+
+/* config: t_sb[7:5]=000 (irrelevant in forced mode), filter[4:2]=000 (off),
+ * spi3w_en[0]=0. Written once to clear the reset defaults. */
+#define BME280_CONFIG_VALUE 0x00u
+
+#if !CONFIG_AS_USE_MOCK_SENSOR
+static i2c_master_bus_handle_t s_bus = NULL;
+static i2c_master_dev_handle_t s_dev = NULL;
+static bme280_calib_t s_cal;
+
+/* ------------------------------------------------------------------ */
+/* register transport                                                  */
+/* ------------------------------------------------------------------ */
+static esp_err_t bme_write_u8(uint8_t reg, uint8_t value)
 {
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (i2c_addr << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, reg, true);
-    i2c_master_write_byte(cmd, data, true);
-    i2c_master_stop(cmd);
-    esp_err_t err = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(100));
-    i2c_cmd_link_delete(cmd);
-    return err;
+    const uint8_t frame[2] = { reg, value };
+    return i2c_master_transmit(s_dev, frame, sizeof(frame),
+                               CONFIG_AS_I2C_TIMEOUT_MS);
 }
 
-static esp_err_t bme_read(uint8_t reg, uint8_t *buf, size_t len)
+static esp_err_t bme_read_block(uint8_t reg, uint8_t *buffer, size_t len)
 {
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (i2c_addr << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, reg, true);
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (i2c_addr << 1) | I2C_MASTER_READ, true);
-    if (len > 1) {
-        i2c_master_read(cmd, buf, len - 1, I2C_MASTER_ACK);
+    if (buffer == NULL || len == 0) {
+        return ESP_ERR_INVALID_ARG;
     }
-    i2c_master_read_byte(cmd, &buf[len - 1], I2C_MASTER_NACK);
-    i2c_master_stop(cmd);
-    esp_err_t err = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(100));
-    i2c_cmd_link_delete(cmd);
-    return err;
+    return i2c_master_transmit_receive(s_dev, &reg, 1, buffer, len,
+                                       CONFIG_AS_I2C_TIMEOUT_MS);
 }
 
-static void bme_read_calibration(void)
+static esp_err_t bme_read_u8(uint8_t reg, uint8_t *value)
 {
-    uint8_t buf[26];
-    if (bme_read(0x88, buf, 26) != ESP_OK) return;
-    bme_cal.dig_T1 = (uint16_t)(buf[0] | (buf[1] << 8));
-    bme_cal.dig_T2 = (int16_t)(buf[2] | (buf[3] << 8));
-    bme_cal.dig_T3 = (int16_t)(buf[4] | (buf[5] << 8));
-    bme_cal.dig_P1 = (uint16_t)(buf[6] | (buf[7] << 8));
-    bme_cal.dig_P2 = (int16_t)(buf[8] | (buf[9] << 8));
-    bme_cal.dig_P3 = (int16_t)(buf[10] | (buf[11] << 8));
-    bme_cal.dig_P4 = (int16_t)(buf[12] | (buf[13] << 8));
-    bme_cal.dig_P5 = (int16_t)(buf[14] | (buf[15] << 8));
-    bme_cal.dig_P6 = (int16_t)(buf[16] | (buf[17] << 8));
-    bme_cal.dig_P7 = (int16_t)(buf[18] | (buf[19] << 8));
-    bme_cal.dig_P8 = (int16_t)(buf[20] | (buf[21] << 8));
-    bme_cal.dig_P9 = (int16_t)(buf[22] | (buf[23] << 8));
-
-    bme_read(0xE1, buf, 7);
-    bme_cal.dig_H1 = buf[0];
-    bme_cal.dig_H2 = (int16_t)(buf[1] | (buf[2] << 8));
-    bme_cal.dig_H3 = buf[3];
-    bme_cal.dig_H4 = (int16_t)((buf[4] << 4) | (buf[5] & 0x0F));
-    bme_cal.dig_H5 = (int16_t)((buf[6] << 4) | ((buf[5] >> 4) & 0x0F));
-    bme_cal.dig_H6 = (int8_t)buf[7];
-    (void)buf[8];
+    return bme_read_block(reg, value, 1);
 }
 
-static int32_t bme_compensate_temp(int32_t adc_t)
+/* ------------------------------------------------------------------ */
+/* measurement sequence (forced mode)                                  */
+/* ------------------------------------------------------------------ */
+static esp_err_t bme_trigger_measurement(void)
 {
-    int32_t var1 = ((((adc_t >> 3) - ((int32_t)bme_cal.dig_T1 << 1))) *
-                    (int32_t)bme_cal.dig_T2) >> 11;
-    int32_t var2 = (((((adc_t >> 4) - (int32_t)bme_cal.dig_T1) *
-                      ((adc_t >> 4) - (int32_t)bme_cal.dig_T1)) >> 12) *
-                    (int32_t)bme_cal.dig_T3) >> 14;
-    bme_cal.t_fine = var1 + var2;
-    return (bme_cal.t_fine * 5 + 128) >> 8;   /* degC * 100 */
+    /* ctrl_hum must be written before ctrl_meas for the humidity
+     * oversampling to take effect (datasheet section 5.4.3). */
+    esp_err_t err = bme_write_u8(BME280_REG_CTRL_HUM, BME280_OSRS_H);
+    if (err != ESP_OK) {
+        return err;
+    }
+    return bme_write_u8(BME280_REG_CTRL_MEAS, BME280_CTRL_MEAS_VALUE);
 }
 
-/* Returns pressure in Pa (float) using the BME280 Q1 equation with int64
- * intermediates to avoid overflow. */
-static float bme_compensate_press(int32_t adc_p)
+/*
+ * Wait until the chip clears the `measuring` bit, with a hard timeout.
+ *
+ * At oversampling x1/x1/x1 the datasheet's worst-case conversion time
+ * (t_measure,max) is well under 20 ms; CONFIG_AS_BME280_MEAS_TIMEOUT_MS is the
+ * upper bound and the function never blocks longer than that. The initial short
+ * delay makes sure we do not sample a status register that has not yet been
+ * updated to `measuring = 1`.
+ */
+static esp_err_t bme_wait_measurement(void)
 {
-    int64_t var1 = (int64_t)bme_cal.t_fine - 128000;
-    int64_t var2 = var1 * var1 * bme_cal.dig_P6;
-    var2 = var2 + ((var1 * (int64_t)bme_cal.dig_P5) << 17);
-    var2 = var2 + (((int64_t)bme_cal.dig_P4) << 35);
-    var1 = ((var1 * var1 * bme_cal.dig_P3) >> 8) +
-           ((var1 * (int64_t)bme_cal.dig_P2) << 12);
-    var1 = (((((int64_t)1) << 47) + var1)) * bme_cal.dig_P1 >> 33;
-    if (var1 == 0) return 0.0f;
+    vTaskDelay(pdMS_TO_TICKS(CONFIG_AS_BME280_MEAS_SETTLE_MS));
 
-    int64_t p = 1048576 - adc_p;
-    p = (((p << 31) - var2) * 3125) / var1;
-    var1 = ((int64_t)bme_cal.dig_P9 * (p >> 13) * (p >> 13)) >> 25;
-    var2 = ((int64_t)bme_cal.dig_P8 * p) >> 19;
-    p = ((p + var1 + var2) >> 8) + ((int64_t)bme_cal.dig_P7 << 4);
-    return (float)p / 256.0f;   /* Pa */
+    const int64_t deadline_us =
+        (int64_t)CONFIG_AS_BME280_MEAS_TIMEOUT_MS * 1000 -
+        (int64_t)CONFIG_AS_BME280_MEAS_SETTLE_MS * 1000;
+    int64_t waited_us = 0;
+
+    while (waited_us < deadline_us) {
+        uint8_t status = 0;
+        esp_err_t err = bme_read_u8(BME280_REG_STATUS, &status);
+        if (err != ESP_OK) {
+            return err;
+        }
+        if ((status & BME280_STATUS_MEASURING) == 0) {
+            return ESP_OK;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+        waited_us += 1000;
+    }
+
+    /* Bounded failure, never an infinite wait: report it and let the caller
+     * decide (the sample is marked invalid rather than silently reused). */
+    return ESP_ERR_TIMEOUT;
 }
+#endif /* !CONFIG_AS_USE_MOCK_SENSOR */
 
-/* Returns humidity in %RH*1024 (int). */
-static int32_t bme_compensate_hum(int32_t adc_h)
-{
-    int32_t x1 = bme_cal.t_fine - 76800;
-    x1 = ((((adc_h << 14) - (bme_cal.dig_H4 << 20) -
-            (bme_cal.dig_H5 * x1)) + 16384) >> 15) *
-         (((((((x1 * bme_cal.dig_H6) >> 10) *
-              (((x1 * bme_cal.dig_H3) >> 11) + 32768)) >> 10)
-            + 2097152) * bme_cal.dig_H2 + 8192) >> 14);
-    x1 = x1 - (((((x1 >> 15) * (x1 >> 15)) >> 7) * bme_cal.dig_H1) >> 4);
-    if (x1 < 0) x1 = 0;
-    if (x1 > 419430400) x1 = 419430400;
-    return x1;
-}
-
+/* ------------------------------------------------------------------ */
+/* public API                                                          */
+/* ------------------------------------------------------------------ */
 int sensor_init(void)
 {
 #if CONFIG_AS_USE_MOCK_SENSOR
     ESP_LOGW(TAG, "MOCK sensor enabled - results are NOT real measurements");
     return 0;
 #else
-    i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
+    const i2c_master_bus_config_t bus_config = {
+        .i2c_port = I2C_NUM_0,
         .sda_io_num = CONFIG_AS_SENSOR_SDA_GPIO,
         .scl_io_num = CONFIG_AS_SENSOR_SCL_GPIO,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = CONFIG_AS_I2C_FREQ_HZ,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
     };
-    esp_err_t err = i2c_param_config(I2C_NUM_0, &conf);
-    if (err != ESP_OK) { ESP_LOGE(TAG, "i2c config failed: %s", esp_err_to_name(err)); return -1; }
-    err = i2c_driver_install(I2C_NUM_0, I2C_MODE_MASTER, 0, 0, 0);
-    if (err != ESP_OK) { ESP_LOGE(TAG, "i2c install failed: %s", esp_err_to_name(err)); return -1; }
-
-    i2c_cmd_handle_t probe = i2c_cmd_link_create();
-    i2c_master_start(probe);
-    i2c_master_write_byte(probe, (i2c_addr << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_stop(probe);
-    err = i2c_master_cmd_begin(I2C_NUM_0, probe, pdMS_TO_TICKS(100));
-    i2c_cmd_link_delete(probe);
+    esp_err_t err = i2c_new_master_bus(&bus_config, &s_bus);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "BME280 not found at 0x%02x: %s", i2c_addr, esp_err_to_name(err));
+        ESP_LOGE(TAG, "i2c bus init failed: %s", esp_err_to_name(err));
         return -1;
     }
 
-    esp_err_t r;
-    uint8_t id = 0;
-    r = bme_read(BME280_ID_REG, &id, 1);
-    ESP_LOGI(TAG, "BME280 chip id=0x%02x (read err=%s)", id, esp_err_to_name(r));
-    if (id != BME280_CHIPID) ESP_LOGW(TAG, "unexpected chip id (is this a BME280?)");
+    const i2c_device_config_t dev_config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = CONFIG_AS_BME280_I2C_ADDR,
+        .scl_speed_hz = CONFIG_AS_I2C_FREQ_HZ,
+    };
+    err = i2c_master_bus_add_device(s_bus, &dev_config, &s_dev);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "i2c device add failed: %s", esp_err_to_name(err));
+        return -1;
+    }
 
-    bme_write(BME280_RESET_REG, BME280_RESET_CMD);
-    vTaskDelay(pdMS_TO_TICKS(10));
+    err = i2c_master_probe(s_bus, CONFIG_AS_BME280_I2C_ADDR,
+                           CONFIG_AS_I2C_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "BME280 not responding at 0x%02x: %s",
+                 (unsigned)CONFIG_AS_BME280_I2C_ADDR, esp_err_to_name(err));
+        return -1;
+    }
 
-    bme_read_calibration();
-    /* ctrl_meas: osrs_t=1<<5 | osrs_p=1<<2 | mode=01 (normal); ctrl_hum osrs_h=1 */
-    bme_write(BME280_CTRL_HUM, 0x01);
-    bme_write(BME280_CTRL_MEAS, (0x01 << 5) | (0x01 << 2) | 0x01);
-    bme_write(BME280_CONFIG, (4 << 5)); /* t_sb=0 -> cycling ~ see datasheet */
+    uint8_t chip_id = 0;
+    err = bme_read_u8(BME280_REG_ID, &chip_id);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "chip id read failed: %s", esp_err_to_name(err));
+        return -1;
+    }
+    if (chip_id != BME280_CHIP_ID) {
+        ESP_LOGE(TAG, "unexpected chip id 0x%02x (expected 0x%02x)",
+                 (unsigned)chip_id, (unsigned)BME280_CHIP_ID);
+        return -1;
+    }
+
+    err = bme_write_u8(BME280_REG_RESET, BME280_RESET_CMD);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "reset failed: %s", esp_err_to_name(err));
+        return -1;
+    }
+    vTaskDelay(pdMS_TO_TICKS(10)); /* datasheet: 2 ms start-up, 10 ms is safe */
+
+    /* Calibration: 26 bytes from 0x88 (which ends at 0xA1 = dig_H1) and
+     * 7 bytes from 0xE1. block2 is padded so no access can exceed it. */
+    uint8_t block1[BME280_CALIB_BLOCK1_LEN];
+    uint8_t block2[BME280_CALIB_BLOCK2_PAD];
+    memset(block2, 0, sizeof(block2));
+
+    err = bme_read_block(BME280_CALIB_BLOCK1_ADDR, block1, sizeof(block1));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "calibration block 1 read failed: %s", esp_err_to_name(err));
+        return -1;
+    }
+    err = bme_read_block(BME280_CALIB_BLOCK2_ADDR, block2, BME280_CALIB_BLOCK2_LEN);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "calibration block 2 read failed: %s", esp_err_to_name(err));
+        return -1;
+    }
+    if (!bme280_parse_calibration(block1, block2, &s_cal)) {
+        ESP_LOGE(TAG, "calibration parse failed");
+        return -1;
+    }
+
+    err = bme_write_u8(BME280_REG_CONFIG, BME280_CONFIG_VALUE);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "config write failed: %s", esp_err_to_name(err));
+        return -1;
+    }
+
+    ESP_LOGI(TAG, "BME280 ready at 0x%02x (forced measurement mode, timeout %d ms)",
+             (unsigned)CONFIG_AS_BME280_I2C_ADDR,
+             (int)CONFIG_AS_BME280_MEAS_TIMEOUT_MS);
     return 0;
-#endif
+#endif /* CONFIG_AS_USE_MOCK_SENSOR */
 }
 
 int sensor_read(sensor_read_t *out)
 {
+    if (out == NULL) {
+        return -1;
+    }
     memset(out, 0, sizeof(*out));
+
 #if CONFIG_AS_USE_MOCK_SENSOR
     mock_fill(out);
     return 0;
 #else
-    uint8_t buf[8];
-    if (bme_read(BME280_PRESS_DATA, buf, 8) != ESP_OK) return -1;
+    esp_err_t err = bme_trigger_measurement();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "measurement trigger failed: %s", esp_err_to_name(err));
+        return -1;
+    }
 
-    int32_t adc_p = (int32_t)(((buf[0] << 16) | (buf[1] << 8) | buf[2]) >> 4);
-    int32_t adc_t = (int32_t)(((buf[3] << 16) | (buf[4] << 8) | buf[5]) >> 4);
-    int32_t adc_h = (int32_t)((buf[6] << 8) | buf[7]);
+    err = bme_wait_measurement();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "measurement did not complete: %s", esp_err_to_name(err));
+        return -1;
+    }
 
-    int32_t t100 = bme_compensate_temp(adc_t);   /* degC * 100 */
-    float press_pa = bme_compensate_press(adc_p);/* Pa */
-    int32_t h1024 = bme_compensate_hum(adc_h);   /* %RH * 1024 */
+    uint8_t data[8];
+    err = bme_read_block(BME280_REG_DATA, data, sizeof(data));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "data read failed: %s", esp_err_to_name(err));
+        return -1;
+    }
 
-    out->value[SEN_CH_TEMPERATURE] = (float)t100 / 100.0f;
-    out->value[SEN_CH_HUMIDITY] = (float)h1024 / 1024.0f;
-    out->value[SEN_CH_PRESSURE] = press_pa / 100.0f;   /* hPa */
-    out->value[SEN_CH_LIGHT] = 0.0f;
+    bme280_uncomp_t raw;
+    bme280_parse_raw(data, &raw);
+
+    int32_t t_fine = 0;
+    const double temperature = bme280_compensate_temperature(&s_cal, raw.temperature, &t_fine);
+    const double pressure_pa = bme280_compensate_pressure(&s_cal, raw.pressure, t_fine);
+    const double humidity = bme280_compensate_humidity(&s_cal, raw.humidity, t_fine);
+
+    out->value[SEN_CH_TEMPERATURE] = (float)temperature;
+    out->value[SEN_CH_HUMIDITY] = (float)humidity;
+    out->value[SEN_CH_PRESSURE] = (float)(pressure_pa / 100.0); /* hPa */
 
     out->valid[SEN_CH_TEMPERATURE] = true;
     out->valid[SEN_CH_HUMIDITY] = true;
     out->valid[SEN_CH_PRESSURE] = true;
-    out->valid[SEN_CH_LIGHT] = false;   /* BH1750 optional / not present */
+
+    /* The light channel needs a separate BH1750, which is NOT implemented in
+     * this version. The channel is reported invalid so the change detector
+     * excludes it, and the README says so explicitly. */
+    out->value[SEN_CH_LIGHT] = 0.0f;
+    out->valid[SEN_CH_LIGHT] = false;
     return 0;
-#endif
+#endif /* CONFIG_AS_USE_MOCK_SENSOR */
 }
 
 const char *sensor_channel_name(sen_channel_t c)
 {
-    static const char *names[SEN_CH_COUNT] = {"temperature", "humidity", "pressure", "light"};
+    static const char *const names[SEN_CH_COUNT] = {
+        "temperature", "humidity", "pressure", "light"
+    };
+    if ((int)c < 0 || (int)c >= (int)SEN_CH_COUNT) {
+        return "unknown";
+    }
     return names[c];
 }

@@ -1,13 +1,22 @@
 # =============================================================
 # AdaptiveSense — Central Experiment Configuration
-# All experiment parameters live here. Do NOT hardcode tuning
-# values in code. Modify this file to change behaviour.
+#
+# This file is the SINGLE SOURCE OF TRUTH for every tunable value.
+# It is mirrored, value for value, into firmware/main/config.example.h.
+# scripts/check_config_parity.py fails the build if the two drift.
+#
+# The normative definition of the behaviour these values drive is
+# docs/change_score_spec.md. Do NOT hardcode tuning values in code.
 # =============================================================
 
 dataset:
   # Reference sampling rate of the ground-truth datasets (Hz).
   ground_truth_rate_hz: 1.0
   raw_dir: dataset/raw
+  # Ground-truth event labels produced by dataset/generate_dataset.py.
+  # These are INDEPENDENT of AdaptiveSense: the generator knows which
+  # interval it drove which channel over. See docs/change_score_spec.md §10.
+  label_dir: dataset/labels
   # Column used as the time axis. Must be monotonically increasing.
   time_col: timestamp
 
@@ -33,6 +42,7 @@ adaptive:
   # A per-channel change signal is normalized by that channel's
   # noise floor (typical minute-to-minute noise amplitude) so that
   # temperature, humidity and pressure can be compared on one scale.
+  # The noise floor is ALSO the normaliser for the upload delta (§8).
   channels:
     temperature:
       noise_floor: 0.15        # °C
@@ -48,48 +58,79 @@ adaptive:
       use: true
 
   analyzer:
-    # Windows expressed in seconds of ground-truth time.
-    variety_window_s: 30       # rolling std window (variance / std change)
-    roc_window_s: 10           # rolling mean of |abs delta| (rate of change)
+    # Windows expressed in seconds of ground-truth time (NOT in samples).
+    # variety_window_s >= roc_window_s is enforced by the config validator.
+    variety_window_s: 30       # window for the rolling std (STD indicator)
+    roc_window_s: 10           # window for the mean absolute rate of change
     baseline_tau_s: 60         # EMA time constant for the change baseline
 
   # State machine thresholds measured in units of "multiples of the
-  # noise floor". Hysteresis is applied RELATIVELY.
+  # noise floor". Hysteresis is applied RELATIVELY: entry uses
+  # threshold*(1+h), retention uses threshold*(1-h).
   stable_threshold: 3.0        # score above this leaves STABLE
   active_threshold: 8.0        # score above this enters ALERT
+
   hysteresis_fraction: 0.5     # relative hysteresis band on each boundary
 
-  # Interval ladder (seconds) per state. The scheduler moves along the
-  # ladder as the state persists.
+  # Interval ladder (seconds) per state, and how many consecutive
+  # evaluations are spent on a rung before advancing to the next one.
+  #
+  #   STABLE ascends (sample less as nothing happens)
+  #   ACTIVE descends (sample faster while the environment is moving)
+  #   ALERT  is fixed at the minimum interval
+  #
+  # v0.1 had active: [60, 30, 15, 5], which made the node WAIT 60 s
+  # immediately after detecting change. Do not restore that ordering.
   ladders:
     stable: [20, 40, 60]
-    active: [60, 30, 15, 5]
+    active: [15, 10, 5]
     alert: [5]
+  ladder_confirmations:
+    stable: 2                  # evaluations per rung before backing off
+    active: 1                  # evaluations per rung before speeding up
 
-  # Event detection (used both for detected events and, at full
-  # resolution, for the ground-truth event mask over the raw dataset).
-  # An event on a channel is declared when the normalized score
-  # stays above event_threshold for >= event_min_duration_s.
+  # Event detection: the score must stay above event_threshold for at
+  # least event_min_duration_s before a sustained event is declared.
   event_threshold: 8.0
   event_min_duration_s: 10.0
 
   # Upload policy (which samples are transmitted to the server).
   upload:
+    upload_first_sample: true  # the node must report its initial state
     on_event: true
     on_state_change: true
     on_interval_change: true
-    heartbeat_s: 60            # guaranteed periodic report (== 1 x max_interval)
-    delta_threshold: 2.0       # report if normalized change vs last upload exceeds this
+    heartbeat_s: 60            # guaranteed periodic report
+    delta_threshold: 2.0       # normalized delta vs the last upload request
 
-  # Energy proxy constants (bytes / estimated transmit energy).
-  # These are ESTIMATED / PROXY values, never presented as real power.
+  # Communication cost bookkeeping.
+  # These are PROXY constants. No physical energy unit is claimed.
   energy:
     payload_bytes_per_upload: 96
-    energy_per_upload_mj: 1.0   # proxy figure, see docs/methodology.md
+    communication_energy_units_per_upload: 1.0   # dimensionless proxy
 
   # Seed for the replay simulator's tie-breaking / noise, kept for
   # reproducible experiments.
   random_seed: 42
+
+# -------------------------------------------------------------
+# Evaluation configuration (metrics only, not used by the node)
+# -------------------------------------------------------------
+evaluation:
+  # Channel-aware one-to-one event matching tolerance, seconds.
+  event_match_tolerance_s: 5.0
+
+  # Ground-truth labelling rule (docs/change_score_spec.md §10).
+  # This is applied by the DATASET GENERATOR to its own noise-free
+  # driven signal, in ABSOLUTE PHYSICAL UNITS. It deliberately does
+  # not reuse the policy's noise floor, so AdaptiveSense cannot
+  # influence what counts as an event.
+  gt_label_min_duration_s: 10.0
+  gt_label_min_deviation:
+    temperature: 1.5         # °C
+    humidity: 8.0            # %RH
+    pressure: 3.0            # hPa
+    light: 250.0             # lux
 
 results:
   output_dir: results

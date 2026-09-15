@@ -1,0 +1,15 @@
+channel,start_s,end_s,event_type
+temperature,242,439,sudden_change
+humidity,243,434,sudden_change
+light,541,621,sudden_change
+humidity,783,906,sudden_change
+temperature,783,913,sudden_change
+temperature,1202,1368,sudden_change
+humidity,1203,1362,sudden_change
+temperature,1862,2006,sudden_change
+humidity,1863,1999,sudden_change
+temperature,2402,2588,sudden_change
+humidity,2403,2582,sudden_change
+light,2701,2761,sudden_change
+humidity,3063,3177,sudden_change
+temperature,3063,3184,sudden_change

@@ -1,18 +1,30 @@
 /*
  * main.c — AdaptiveSense node main loop.
  *
- * Enforces the documented duty cycle:
+ * Documented duty cycle (one iteration):
  *
- *   WAKE
- *   -> READ SENSOR
- *   -> EVALUATE CHANGE (change_detector) / decide event
- *   -> ADAPTIVE SCHEDULER (state, interval, upload decision)
- *   -> DECIDE UPLOAD (publish MQTT if upload)
- *   -> DETERMINE NEXT INTERVAL
- *   -> SLEEP for the remaining time until the next sample
+ *   SLEEP until the scheduled sample time
+ *   -> READ SENSOR            (forced-mode BME280 conversion)
+ *   -> EVALUATE CHANGE        (change_detector: score + debounced event)
+ *   -> ADAPTIVE SCHEDULER     (state, next interval, upload decision)
+ *   -> PUBLISH if requested   (and record whether the broker accepted it)
+ *   -> DETERMINE NEXT WAKE
  *
  * The layers (sensor / change detection / adaptive scheduler / communication /
  * power management) are wired here and never know about each other directly.
+ * The configuration is built by policy_config.c so that the device and the
+ * host-side parity test run the identical policy configuration.
+ *
+ * Three behaviours differ from v0.1 and are deliberate:
+ *
+ *  1. A failed sensor read does NOT feed a zeroed sample into the change
+ *     detector. The EMA baseline would be poisoned by the zeros, so the node
+ *     retries after `min_interval` instead.
+ *  2. `upload_requested` (the policy decision) and `publish_success` (the
+ *     transport outcome) are logged and counted separately. v0.1 discarded the
+ *     publish return value, so a dead broker was invisible.
+ *  3. The sleep mode is stated at boot and never aliases deep sleep onto a light
+ *     sleep call.
  */
 #include <math.h>
 #include <stdio.h>
@@ -27,141 +39,132 @@
 #include "change_detector.h"
 #include "communication.h"
 #include "config.h"
+#include "policy_config.h"
 #include "power_mgmt.h"
 #include "sensor.h"
 
 static const char *TAG = "main";
 
-/* ------------------------------------------------------------------ */
-/* Channel configuration (mirrors experiments/experiment_config.yaml)  */
-/* ------------------------------------------------------------------ */
-static const cd_channel_cfg_t CHANNEL_CFG[CD_NUM_CHANNELS] = {
-    { .use = true,  .noise_floor = CONFIG_AS_NOISE_FLOOR_TEMP  },
-    { .use = (bool)CONFIG_AS_USE_HUMIDITY,  .noise_floor = CONFIG_AS_NOISE_FLOOR_HUM    },
-    { .use = (bool)CONFIG_AS_USE_PRESSURE,  .noise_floor = CONFIG_AS_NOISE_FLOOR_PRESS  },
-    { .use = (bool)CONFIG_AS_USE_LIGHT,     .noise_floor = CONFIG_AS_NOISE_FLOOR_LIGHT  },
-};
+/* Log a duty-cycle + counter summary every N cycles. */
+#define STATS_LOG_EVERY_CYCLES 10u
 
-/* Interval ladders, indexed by as_state_t. */
-static const float LADDER_STABLE[3] = CONFIG_AS_LADDER_STABLE;
-static const float LADDER_ACTIVE[4] = CONFIG_AS_LADDER_ACTIVE;
-static const float LADDER_ALERT[1]  = CONFIG_AS_LADDER_ALERT;
+/* The state and comm enums must share the same ordering. */
+_Static_assert((int)AS_STABLE == (int)COMM_STABLE, "state enum mismatch");
+_Static_assert((int)AS_ACTIVE == (int)COMM_ACTIVE, "state enum mismatch");
+_Static_assert((int)AS_ALERT == (int)COMM_ALERT, "state enum mismatch");
+_Static_assert(CD_NUM_CHANNELS == AS_NUM_CHANNELS, "channel count mismatch");
 
-static const float *LADDERS[AS_NUM_STATES] = {
-    LADDER_STABLE, LADDER_ACTIVE, LADDER_ALERT
-};
-static const size_t LADDER_LENS[AS_NUM_STATES] = { 3, 4, 1 };
-
-static as_config_t g_sched_cfg;
+/* Detector and scheduler live in static storage: `cd_t` alone is several
+ * kilobytes, which would not fit on an app_main stack. */
 static cd_config_t g_cd_cfg;
+static as_config_t g_sched_cfg;
+static cd_t g_detector;
+static as_t g_scheduler;
+
 static float g_values[CD_NUM_CHANNELS];
 static bool  g_valid[CD_NUM_CHANNELS];
-
-/* Map sensor channels -> change-detector channels (both 0..3 in same order). */
-static cd_channel_t to_cd[CD_NUM_CHANNELS] = {
-    CD_CH_TEMPERATURE, CD_CH_HUMIDITY, CD_CH_PRESSURE, CD_CH_LIGHT
-};
-
-static void build_configs(void)
-{
-    g_sched_cfg.min_interval = CONFIG_AS_MIN_INTERVAL_S;
-    g_sched_cfg.default_interval = CONFIG_AS_DEFAULT_INTERVAL_S;
-    g_sched_cfg.max_interval = CONFIG_AS_MAX_INTERVAL_S;
-    g_sched_cfg.stable_threshold = CONFIG_AS_STABLE_THRESHOLD;
-    g_sched_cfg.active_threshold = CONFIG_AS_ACTIVE_THRESHOLD;
-    g_sched_cfg.hysteresis_fraction = CONFIG_AS_HYSTERESIS_FRACTION;
-    memcpy(g_sched_cfg.ladders, LADDERS, sizeof(LADDERS));
-    memcpy(g_sched_cfg.ladder_len, LADDER_LENS, sizeof(LADDER_LENS));
-    g_sched_cfg.up_on_event = (bool)CONFIG_AS_UP_ON_EVENT;
-    g_sched_cfg.up_on_state_change = (bool)CONFIG_AS_UP_ON_STATE_CHANGE;
-    g_sched_cfg.up_on_interval_change = (bool)CONFIG_AS_UP_ON_INTERVAL_CHANGE;
-    g_sched_cfg.heartbeat_s = CONFIG_AS_UP_HEARTBEAT_S;
-    g_sched_cfg.delta_threshold = CONFIG_AS_UP_DELTA_THRESHOLD;
-    g_sched_cfg.delta_channel_use[0] = true;
-    g_sched_cfg.delta_channel_use[1] = (bool)CONFIG_AS_USE_HUMIDITY;
-    g_sched_cfg.delta_channel_use[2] = (bool)CONFIG_AS_USE_PRESSURE;
-    g_sched_cfg.delta_channel_use[3] = (bool)CONFIG_AS_USE_LIGHT;
-
-    memcpy(g_cd_cfg.channels, CHANNEL_CFG, sizeof(CHANNEL_CFG));
-    g_cd_cfg.baseline_tau_s = CONFIG_AS_BASELINE_TAU_S;
-    g_cd_cfg.event_threshold = CONFIG_AS_EVENT_THRESHOLD;
-    g_cd_cfg.event_min_duration_s = CONFIG_AS_EVENT_MIN_DURATION_S;
-}
 
 void app_main(void)
 {
     ESP_LOGI(TAG, "AdaptiveSense node booting (device=%s)", CONFIG_AS_DEVICE_ID);
+    ESP_LOGI(TAG, "sleep mode: %s", power_sleep_mode_name(power_sleep_mode()));
+    ESP_LOGI(TAG, "BME280 measurement mode: forced (one conversion per sample)");
 
-    build_configs();
+    policy_build_detector_config(&g_cd_cfg);
+    policy_build_scheduler_config(&g_sched_cfg);
 
     if (sensor_init() != 0) {
-        ESP_LOGE(TAG, "sensor init failed; continuing with mock data");
+        ESP_LOGE(TAG, "sensor init failed; every sample will be retried");
     }
 
     if (communication_start() != 0) {
-        ESP_LOGW(TAG, "communication start failed; will retry publishing");
+        ESP_LOGW(TAG, "communication start failed; publishes will count as failures");
     }
 
-    cd_t detector;
-    cd_init(&detector, &g_cd_cfg);
+    cd_init(&g_detector, &g_cd_cfg);
+    as_init(&g_scheduler, &g_sched_cfg);
+    if (g_detector.hist_truncated) {
+        ESP_LOGE(TAG, "history ring overflowed: increase CD_MAX_SLOTS");
+    }
 
-    as_t scheduler;
-    as_init(&scheduler, &g_sched_cfg);
-
-    /* reference clock in seconds since boot */
-    double now = (double)esp_timer_get_time() / 1e6;
-    double next_wake = now;
-    uint32_t cycle = 0;
+    /* Seconds since boot, from the single documented time base. */
+    double next_wake = (double)esp_timer_get_time() / 1e6;
+    unsigned long cycle = 0;
 
     while (1) {
         cycle++;
 
-        now = (double)esp_timer_get_time() / 1e6;
-        if (now < next_wake - 0.2) {
-            /* arrived early; sleep for the remainder */
-            double remaining = next_wake - now;
+        /* ---- SLEEP until the scheduled sample time ---------------------- */
+        double now = (double)esp_timer_get_time() / 1e6;
+        if (next_wake > now) {
             power_set_phase(PM_SLEEP);
-            double slept = power_sleep(remaining);
-            now += slept;
+            const double requested = next_wake - now;
+            const double slept = power_sleep(requested);
+            if (slept + 0.5 < requested) {
+                ESP_LOGD(TAG, "sleep returned early: requested %.2fs, got %.2fs",
+                         requested, slept);
+            }
+            now = (double)esp_timer_get_time() / 1e6;
         }
+        const double t_sample = now;
 
-        /* ---- WAKE: sample the sensor -------------------------------- */
+        /* ---- READ SENSOR ------------------------------------------------ */
         power_set_phase(PM_SAMPLE);
-        sensor_read_t sr;
-        if (sensor_read(&sr) != 0) {
-            ESP_LOGW(TAG, "sensor read failed at cycle %lu", (unsigned long)cycle);
+        sensor_read_t reading;
+        if (sensor_read(&reading) != 0) {
+            ESP_LOGW(TAG, "sensor read failed at cycle %lu; retrying in %ds",
+                     cycle, (int)CONFIG_AS_MIN_INTERVAL_S);
+            next_wake = t_sample + (double)CONFIG_AS_MIN_INTERVAL_S;
+            continue;
         }
-        memcpy(g_valid, sr.valid, sizeof(g_valid));
+        memcpy(g_valid, reading.valid, sizeof(g_valid));
         for (int i = 0; i < CD_NUM_CHANNELS; i++) {
-            g_values[i] = sr.value[i];
+            g_values[i] = reading.value[i];
         }
 
-        /* ---- EVALUATE CHANGE ---------------------------------------- */
-        now = (double)esp_timer_get_time() / 1e6;
+        /* ---- EVALUATE CHANGE -------------------------------------------- */
         bool event = false;
-        float score = cd_update(&detector, now, g_values, g_valid, &event);
+        const float score =
+            cd_update(&g_detector, t_sample, g_values, g_valid, &event);
 
-        /* ---- ADAPTIVE SCHEDULER -------------------------------------- */
-        as_decision_t dec;
-        as_update(&scheduler, now, g_values, NULL, score, event, &dec);
+        /* ---- ADAPTIVE SCHEDULER ----------------------------------------- */
+        as_decision_t decision;
+        as_update(&g_scheduler, t_sample, g_values, g_valid, score, event,
+                  &decision);
 
-        /* ---- DECIDE UPLOAD ------------------------------------------- */
-        if (dec.upload) {
+        /* ---- DECIDE UPLOAD / TRANSPORT ---------------------------------- */
+        bool publish_success = false;
+        if (decision.upload_requested) {
             power_set_phase(PM_TRANSMIT);
-            communication_publish(now * 1000.0, g_values,
-                                  (comm_state_t)dec.state,
-                                  dec.interval_s, dec.detected_event);
+            publish_success =
+                communication_publish(t_sample * 1000.0, g_values,
+                                      (comm_state_t)decision.state,
+                                      decision.interval_s,
+                                      decision.detected_event) == 0;
         } else {
             power_set_phase(PM_ACTIVE);
         }
 
-        ESP_LOGD(TAG, "cycle=%lu t=%.1f state=%d interval=%.1fs score=%.2f "
-                      "upload=%d event=%d temp=%.2f hum=%.2f",
-                 (unsigned long)cycle, now, (int)dec.state, dec.interval_s,
-                 (double)score, dec.upload, dec.detected_event,
+        ESP_LOGI(TAG,
+                 "cycle=%lu t=%.1f state=%d interval=%.1fs score=%.2f "
+                 "event=%d upload_requested=%d publish_success=%d "
+                 "temp=%.2f hum=%.2f",
+                 cycle, t_sample, (int)decision.state, decision.interval_s,
+                 (double)score, (int)decision.detected_event,
+                 (int)decision.upload_requested, (int)publish_success,
                  (double)g_values[0], (double)g_values[1]);
 
-        /* ---- DETERMINE NEXT INTERVAL, then SLEEP ----------------------- */
-        next_wake = now + dec.interval_s;
+        /* ---- DETERMINE NEXT WAKE ---------------------------------------- */
+        next_wake = t_sample + (double)decision.interval_s;
+
+        if (cycle % STATS_LOG_EVERY_CYCLES == 0) {
+            const power_stats_t *pw = power_get_stats();
+            communication_log_stats();
+            ESP_LOGI(TAG,
+                     "duty cycle: sleeps=%lu light_ok=%lu light_failed=%lu "
+                     "sleep_requested=%.1fs sleep_actual=%.1fs",
+                     pw->sleep_calls, pw->light_sleep_ok, pw->light_sleep_failed,
+                     pw->requested_s, pw->actual_s);
+        }
     }
 }

@@ -1,28 +1,32 @@
-"""AdaptiveSense change-aware adaptive sampling scheduler.
+"""AdaptiveSense policy: adaptive sampling scheduler.
 
-This module implements the AdaptiveSense policy as a self-contained,
-stateless-interleaving stream algorithm. The exact same logic is mirrored in
-the embedded firmware (`firmware/`) so that simulator results and on-device
-behaviour remain comparable.
+Normative implementation of `docs/change_score_spec.md` sections 1-9. The
+identical equations are implemented in C in
+`firmware/main/change_detector.c` (score) and
+`firmware/main/adaptive_scheduler.c` (state machine, ladder, upload policy);
+`tests/test_parity_python_c.py` compiles the C policy for the host and compares
+the two implementations on a shared fixture.
 
-The scheduler receives one measured value per channel at irregular times
-(replay decides when to call :meth:`update` based on the previously returned
-interval) and decides:
+The scheduler receives one measured value per channel at irregular times and
+decides:
 
-- the sampling interval to use for the *next* sample,
-- the current STABLE / ACTIVE / ALERT state,
-- whether a sustained event is detected (debounced),
-- whether this sample should be uploaded to the server.
+* the sampling interval to use for the *next* sample,
+* the current STABLE / ACTIVE / ALERT state,
+* whether a sustained event is active (debounced),
+* whether this sample should be uploaded.
 
-The scheduler is intentionally decoupled from any sensor driver or time base.
+It is decoupled from any sensor driver or time base: the caller says what time
+it is and what was measured.
 """
 
 from __future__ import annotations
 
 import math
-from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
+
+from .config import analyzer_config, confirmations, ladder
+from .scoring import ChangeAnalyzer
 
 # States of the scheduler state machine.
 STABLE = "STABLE"
@@ -30,13 +34,73 @@ ACTIVE = "ACTIVE"
 ALERT = "ALERT"
 STATES = (STABLE, ACTIVE, ALERT)
 
+__all__ = [
+    "STABLE",
+    "ACTIVE",
+    "ALERT",
+    "STATES",
+    "Decision",
+    "AdaptiveScheduler",
+    "transition",
+    "next_rung",
+    "hysteresis_bounds",
+]
 
-@dataclass
-class ChannelAnalyzerConfig:
-    """Per-channel configuration consumed by the scheduler."""
 
-    noise_floor: float
-    use: bool
+def hysteresis_bounds(
+    stable_threshold: float, active_threshold: float, hysteresis_fraction: float
+) -> Dict[str, float]:
+    """Entry (upper) and retention (lower) bounds for the state machine (§6)."""
+    h = hysteresis_fraction
+    return {
+        "stable_high": stable_threshold * (1.0 + h),
+        "stable_low": stable_threshold * (1.0 - h),
+        "active_high": active_threshold * (1.0 + h),
+        "active_low": active_threshold * (1.0 - h),
+    }
+
+
+def transition(state: str, score: float, bounds: Dict[str, float]) -> str:
+    """Pure state transition (spec section 6).
+
+    Asymmetric on purpose:
+
+    * **escalation is immediate** — a score above a state's entry bound reaches
+      that state in a single sample, so STABLE can go straight to ALERT.
+    * **de-escalation moves one level at a time** and only once the score has
+      fallen below the current state's *retention* bound. The node is therefore
+      quick to react and cautious to relax: an ALERT does not drop straight to
+      STABLE (and to a 20 s interval) while the environment is still moving.
+    """
+    if score >= bounds["active_high"]:
+        return ALERT
+    if state == ALERT:
+        return ALERT if score >= bounds["active_low"] else ACTIVE
+    if score >= bounds["stable_high"]:
+        return ACTIVE
+    if state == ACTIVE:
+        return ACTIVE if score >= bounds["stable_low"] else STABLE
+    return STABLE
+
+
+def next_rung(
+    position: int, rung_count: int, ladder: List[float], confirmations: int
+) -> "tuple[float, int, int]":
+    """Pure ladder step (spec section 7).
+
+    Returns ``(interval, new_position, new_rung_count)``. A rung is held for
+    ``confirmations`` consecutive evaluations before the ladder advances; the
+    position is clamped to the last rung, so a state that persists settles on its
+    final interval instead of running off the end.
+    """
+    last = len(ladder) - 1
+    pos = min(position, last)
+    interval = ladder[pos]
+
+    count = rung_count + 1
+    if count >= confirmations:
+        return interval, min(pos + 1, last), 0
+    return interval, pos, count
 
 
 @dataclass
@@ -49,7 +113,7 @@ class Decision:
     interval_s: float
     score: float
     detected_event: bool
-    upload: bool
+    upload_requested: bool
     channel_scores: Dict[str, float] = field(default_factory=dict)
 
 
@@ -58,192 +122,107 @@ class AdaptiveScheduler:
 
     def __init__(self, config: dict, *, time: float = 0.0) -> None:
         self.config = config
+        a = config["adaptive"]
 
-        # --- sanitized, centralized parameters -----------------------------
         samp = config["sampling"]
         self.min_interval = float(samp["min_interval"])
         self.default_interval = float(samp["default_interval"])
         self.max_interval = float(samp["max_interval"])
 
-        a = config["adaptive"]
         self.stable_threshold = float(a["stable_threshold"])
         self.active_threshold = float(a["active_threshold"])
         self.hyst = float(a["hysteresis_fraction"])
 
-        # relative hysteresis on each boundary
-        self._stable_high = self.stable_threshold * (1.0 + self.hyst)
-        self._stable_low = self.stable_threshold * (1.0 - self.hyst)
-        self._active_high = self.active_threshold * (1.0 + self.hyst)
-        self._active_low = self.active_threshold * (1.0 - self.hyst)
+        # entry (upper) and retention (lower) bounds — spec section 6
+        self.bounds = hysteresis_bounds(
+            self.stable_threshold, self.active_threshold, self.hyst
+        )
+        self.stable_high = self.bounds["stable_high"]
+        self.stable_low = self.bounds["stable_low"]
+        self.active_high = self.bounds["active_high"]
+        self.active_low = self.bounds["active_low"]
 
-        self.ladders: Dict[str, List[float]] = {
-            s: [float(x) for x in a["ladders"][s.lower()]]
-            for s in STATES
-        }
-        self.event_threshold = float(a["event_threshold"])
-        self.event_min_duration = float(a["event_min_duration_s"])
+        self.ladders: Dict[str, List[float]] = {s: ladder(config, s) for s in STATES}
+        self.confirm: Dict[str, int] = {s: confirmations(config, s) for s in STATES}
 
         up = a["upload"]
+        self.up_first_sample = bool(up.get("upload_first_sample", True))
         self.up_on_event = bool(up["on_event"])
         self.up_on_state_change = bool(up["on_state_change"])
         self.up_on_interval_change = bool(up["on_interval_change"])
         self.heartbeat = float(up["heartbeat_s"])
         self.delta_threshold = float(up["delta_threshold"])
 
-        an = a["analyzer"]
-        self.avg_window = float(an["variety_window_s"])
-        self.roc_window = float(an["roc_window_s"])
-        self.baseline_tau = float(an["baseline_tau_s"])
-
-        # channel selection
-        self.channels: Dict[str, ChannelAnalyzerConfig] = {}
-        for name, ch in a["channels"].items():
-            self.channels[name] = ChannelAnalyzerConfig(
-                noise_floor=max(1e-9, float(ch["noise_floor"])),
-                use=bool(ch["use"]),
-            )
-
         # --- runtime state -------------------------------------------------
+        self.analyzer = ChangeAnalyzer(analyzer_config(config))
         self.now = float(time)
-        self.state = STABLE
+        self.state: str = STABLE
         self._ladder_pos: Dict[str, int] = {s: 0 for s in STATES}
+        self._rung_count: Dict[str, int] = {s: 0 for s in STATES}
         self._interval = self.default_interval
 
-        # per-channel rolling windows keyed by name
-        self._hist: Dict[str, deque] = {name: deque() for name in self.channels}
-        self._last_time: Optional[float] = None
-        self._prev_values: Dict[str, Optional[float]] = {
-            name: None for name in self.channels
-        }
-        # persistent EMA baseline per channel (robust across long intervals)
-        self._ema: Dict[str, Optional[float]] = {
-            name: None for name in self.channels
-        }
-
-        # upload bookkeeping
-        self._last_upload: Optional[float] = None
-        self._last_upload_values: Dict[str, Optional[float]] = {
-            name: None for name in self.channels
-        }
-        self._last_state = self.state
-        self._last_interval = self._interval
-
-        # event debounce
-        self._event_potential_start: Optional[float] = None
-        self._event_active = False
-        self._notified_event = False
+        self._n_samples = 0
+        self._last_interval = self.default_interval
+        self._last_upload_t: Optional[float] = None
+        self._last_upload_values: Dict[str, float] = {}
+        self._prev_event_active = False
 
     # ------------------------------------------------------------------ #
     # private helpers
     # ------------------------------------------------------------------ #
-    def _window_values(self, name: str, window: float) -> List[float]:
-        """Values in `_hist[name]` that fall within the last `window` s."""
-        out = []
-        for t, v in self._hist[name]:
-            if t >= self.now - window:
-                out.append(v)
-        return out
+    def _next_state(self, score: float, state: str) -> str:
+        """State machine with immediate escalation, hysteretic retention (§6)."""
+        return transition(state, score, self.bounds)
 
-    def _update_ema(self, name: str, value: float) -> float:
-        """Update the persistent EMA baseline, return the deviation ref (old EMA)."""
-        ref = self._ema[name]
-        if ref is None:
-            self._ema[name] = value
-            return value
-        dt = 0.0
-        if self._last_time is not None and self.now > self._last_time:
-            dt = self.now - self._last_time
-        alpha = dt / (dt + self.baseline_tau) if dt > 0 else 0.0
-        new_ema = ref + alpha * (value - ref)
-        self._ema[name] = new_ema
-        return ref
-
-    def _channel_score(self, name: str, value: float, ref: float) -> float:
-        ch = self.channels[name]
-        rows = list(self._hist[name])
-        base = ch.noise_floor
-
-        # deviation from the persistent EMA change baseline (robust across
-        # long sampling intervals, because the baseline is not forgotten)
-        dev = abs(value - ref)
-
-        # variance / std of the recent variety window
-        var_vals = self._window_values(name, self.avg_window)
-        if len(var_vals) >= 2:
-            m = sum(var_vals) / len(var_vals)
-            var = sum(v * v for v in var_vals) / len(var_vals) - m * m
-            std = math.sqrt(max(0.0, var))
-        else:
-            std = 0.0
-
-        # rate of change: mean |dv/dt| over recent transitions
-        prev_t = self._last_time
-        prev_v = self._prev_values[name]
-        if prev_v is not None and prev_t is not None and self.now > prev_t:
-            roc_inst = abs(value - prev_v) / (self.now - prev_t)
-        else:
-            roc_inst = 0.0
-        roc_vals = [roc_inst] + [
-            abs(v2 - v1) / (t2 - t1)
-            for (t1, v1), (t2, v2) in zip(rows, rows[1:])
-            if t2 - t1 > 0
-        ]
-        roc = sum(roc_vals) / len(roc_vals) if roc_vals else 0.0
-
-        score = max(dev / base, std / base, roc / base)
-        return score
-
-    def _compute_score(self, values: Dict[str, float], refs: Dict[str, float]) -> float:
-        channel_scores: Dict[str, float] = {}
-        overall = 0.0
-        for name, ch in self.channels.items():
-            if not ch.use or name not in values:
-                channel_scores[name] = 0.0
-                continue
-            sc = self._channel_score(name, values[name], refs[name])
-            channel_scores[name] = sc
-            overall = max(overall, sc)
-        return overall, channel_scores
-
-    def _apply_state_machine(self, score: float) -> None:
-        """Update state with relative hysteresis on each boundary."""
-        s = self.state
-        if s == STABLE:
-            if score > self._stable_high:
-                s = ACTIVE
-        elif s == ACTIVE:
-            if score < self._stable_low:
-                s = STABLE
-            elif score > self._active_high:
-                s = ALERT
-        elif s == ALERT:
-            if score < self._active_low:
-                s = ACTIVE
-        else:  # pragma: no cover - defensive
-            s = STABLE
-        self.state = s
+    def _reset_ladder(self) -> None:
+        self._ladder_pos = {s: 0 for s in STATES}
+        self._rung_count = {s: 0 for s in STATES}
 
     def _advance_ladder(self) -> float:
-        """Advance the interval ladder for the current state, return new interval."""
-        ladder = self.ladders[self.state]
-        pos = min(self._ladder_pos[self.state], len(ladder) - 1)
-        self._ladder_pos[self.state] = pos + 1  # advance every evaluation
-        return ladder[pos]
+        """Return the interval for the next sample and advance the ladder (§7)."""
+        state = self.state
+        interval, pos, count = next_rung(
+            self._ladder_pos[state],
+            self._rung_count[state],
+            self.ladders[state],
+            self.confirm[state],
+        )
+        self._ladder_pos[state] = pos
+        self._rung_count[state] = count
+        return interval
 
-    def _reset_ladder_position(self) -> None:
-        self._ladder_pos = {s: 0 for s in STATES}
-
-    def _update_event(self, score: float) -> bool:
-        if score > self.event_threshold:
-            if self._event_potential_start is None:
-                self._event_potential_start = self.now
-            if self.now - self._event_potential_start >= self.event_min_duration:
-                self._event_active = True
-                return True
-        else:
-            self._event_potential_start = None
-            self._event_active = False
-            self._notified_event = False
+    def _upload_decision(
+        self,
+        values: Dict[str, float],
+        event_onset: bool,
+        state_changed: bool,
+        interval_changed: bool,
+    ) -> bool:
+        """Spec section 8."""
+        if self.up_first_sample and self._n_samples == 1:
+            return True
+        if self.up_on_event and event_onset:
+            return True
+        if self.up_on_state_change and state_changed:
+            return True
+        if self.up_on_interval_change and interval_changed:
+            return True
+        if (
+            self.heartbeat > 0.0
+            and self._last_upload_t is not None
+            and (self.now - self._last_upload_t) >= self.heartbeat
+        ):
+            return True
+        if self.delta_threshold > 0.0:
+            for cf in self.analyzer.cfg.channels:
+                if not cf.use or cf.name not in values:
+                    continue
+                last_up = self._last_upload_values.get(cf.name)
+                if last_up is None:
+                    continue
+                normalized = abs(float(values[cf.name]) - last_up) / cf.noise_floor
+                if normalized >= self.delta_threshold:
+                    return True
         return False
 
     # ------------------------------------------------------------------ #
@@ -252,76 +231,30 @@ class AdaptiveScheduler:
     def update(self, timestamp: float, values: Dict[str, float]) -> Decision:
         """Feed one measured sample into the scheduler and get a decision."""
         self.now = float(timestamp)
+        self._n_samples += 1
 
-        # record history and advance the per-channel EMA baseline
-        refs: Dict[str, float] = {}
-        for name in self.channels:
-            if name in values:
-                self._hist[name].append((self.now, values[name]))
-                refs[name] = self._update_ema(name, values[name])
-                # prune older history
-                while (
-                    self._hist[name]
-                    and self._hist[name][0][0] < self.now - self.avg_window
-                ):
-                    self._hist[name].popleft()
+        score, channel_scores, event_active = self.analyzer.update(self.now, values)
+        event_onset = event_active and not self._prev_event_active
 
-        score, channel_scores = self._compute_score(values, refs)
-
-        # event detection on the live (sampled) stream
-        detected_event = self._update_event(score)
-        if detected_event and not self._notified_event:
-            self._notified_event = True
-
-        # state machine
         prev_state = self.state
-        self._apply_state_machine(score)
+        self.state = self._next_state(score, prev_state)
         state_changed = self.state != prev_state
         if state_changed:
-            self._reset_ladder_position()
+            self._reset_ladder()
 
-        # choose interval for the NEXT sample
         new_interval = self._advance_ladder()
-        self._interval = new_interval
         interval_changed = not math.isclose(new_interval, self._last_interval)
+        self._interval = new_interval
 
-        # --- upload decision ---------------------------------------------
-        upload = False
-        if self.up_on_event and detected_event:
-            upload = True
-        if self.up_on_state_change and state_changed and not upload:
-            upload = True
-        if self.up_on_interval_change and interval_changed and not upload:
-            upload = True
-        # heartbeat guarantee
-        if (
-            self.heartbeat > 0
-            and self._last_upload is not None
-            and (self.now - self._last_upload) >= self.heartbeat
-        ):
-            upload = True
-        # change-driven delta reporting
-        if not upload and self.delta_threshold > 0:
-            for name in self.channels:
-                if not self.channels[name].use or name not in values:
-                    continue
-                last_up = self._last_upload_values.get(name)
-                if last_up is not None:
-                    nd = abs(values[name] - last_up) / self.channels[name].noise_floor
-                    if nd >= self.delta_threshold:
-                        upload = True
-                        break
-
+        upload = self._upload_decision(
+            values, event_onset, state_changed, interval_changed
+        )
         if upload:
-            self._last_upload = self.now
-            self._last_upload_values = dict(values)
+            self._last_upload_t = self.now
+            self._last_upload_values = {k: float(v) for k, v in values.items()}
 
-        # persist transition tracking
-        self._last_state = self.state
-        self._last_interval = self._interval
-        self._last_time = self.now
-        for name, v in values.items():
-            self._prev_values[name] = v
+        self._prev_event_active = event_active
+        self._last_interval = new_interval
 
         return Decision(
             timestamp=self.now,
@@ -329,8 +262,8 @@ class AdaptiveScheduler:
             state=self.state,
             interval_s=new_interval,
             score=score,
-            detected_event=detected_event,
-            upload=upload,
+            detected_event=event_active,
+            upload_requested=upload,
             channel_scores=channel_scores,
         )
 
@@ -340,5 +273,9 @@ class AdaptiveScheduler:
         return self._interval
 
     @property
-    def current_state(self) -> str:
+    def state_name(self) -> str:
         return self.state
+
+    @property
+    def n_samples(self) -> int:
+        return self._n_samples

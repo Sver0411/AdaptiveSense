@@ -1,0 +1,58 @@
+name: ESP-IDF build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "firmware/**"
+      - ".github/workflows/esp-idf-build.yml"
+  pull_request:
+    paths:
+      - "firmware/**"
+      - ".github/workflows/esp-idf-build.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ESP32-S3 firmware build
+    runs-on: ubuntu-latest
+
+    # Official Espressif image. The tag is pinned so the build is reproducible;
+    # bump it deliberately together with the ESP-IDF version in the README.
+    container:
+      image: espressif/idf:release-v5.4
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # `idf.py build` needs no credentials: main/CMakeLists.txt provisions the
+      # git-ignored config.h from config.example.h when it is absent.
+      - name: Build for esp32s3
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh"
+          cd firmware
+          idf.py set-target esp32s3
+          idf.py build 2>&1 | tee /tmp/build.log
+          # Fail the job on any compiler warning from the project's own sources.
+          if grep -E "warning:" /tmp/build.log | grep -E "main/(main|sensor|bme280_math|change_detector|adaptive_scheduler|communication|power_mgmt|policy_config)\.[ch]"; then
+            echo "::error::Compiler warnings in AdaptiveSense sources"
+            exit 1
+          fi
+
+      - name: Report image size
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh"
+          cd firmware
+          idf.py size
+
+      - name: Upload firmware binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32s3-firmware
+          path: |
+            firmware/build/AdaptiveSense.bin
+            firmware/build/AdaptiveSense.elf
+            firmware/build/bootloader/bootloader.bin
+          if-no-files-found: error

@@ -33,6 +33,17 @@ credentials*
 
 # --- ESP-IDF --------------------------------------------------------------
 firmware/partition_table/*.bin
+# Any stray build tree (e.g. one moved aside while debugging a configure error)
+firmware/build*/
+firmware/sdkconfig.old
+
+# --- Host-side test artifacts ---------------------------------------------
+# The parity and BME280 tests compile the firmware sources for the host.
+# They always build into a temporary directory, so nothing should appear here;
+# these entries exist so a stray manual build can never be committed.
+tests/c_host/*.o
+tests/c_host/*.bin
+*.parity
 
 # --- Live / transient results ------------------------------------------------
 # Committed results are the reproducible simulation outputs under results/.
@@ -44,3 +55,7 @@ results/live/
 *.swo
 .idea/
 .vscode/
+# --- Agent / workspace metadata ---------------------------------------------
+# Local assistant working notes (memory, project skills). Not project content:
+# the reader-facing record lives in docs/ and results/.
+.workbuddy/

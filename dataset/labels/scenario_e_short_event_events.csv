@@ -1,0 +1,3 @@
+channel,start_s,end_s,event_type
+humidity,1561,1585,sudden_change
+temperature,1561,1585,sudden_change

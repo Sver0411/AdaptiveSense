@@ -1,70 +1,106 @@
 """Automated AdaptiveSense analysis and experiment runner.
 
-One command turns the ground-truth datasets into a metrics table and the
-five required figures:
-
     python analysis/analyze.py
 
 Pipeline:
-    1. load the central experiment config,
-    2. replay every strategy (Fixed-5/10/20/40/60 and AdaptiveSense) over each
-       ground-truth scenario from ``dataset/raw/``,
-    3. compute the full metric set per run,
-    4. write CSV results under ``results/``,
-    5. render the figures under ``results/plots/``.
 
-All figures and numbers produced here are **simulation results** on synthetic
-ground truth. They are stored separately from any future hardware results.
+1. load the central experiment config,
+2. for every scenario in ``dataset/raw/`` load the raw signal **and its
+   independent ground-truth labels** from ``dataset/labels/``,
+3. replay every strategy (Fixed-5/10/20/40/60 and AdaptiveSense),
+4. write one row per sample per strategy under ``results/sim/<scenario>/``,
+5. compute per-scenario metrics (``results/metrics_all.csv``) and
+   micro-aggregated overall metrics (``results/metrics_summary.csv``),
+6. render the figures under ``results/plots/``.
+
+Everything produced here is a **synthetic simulation result**. No hardware
+measurement is involved. See `docs/change_score_spec.md` for the metric
+definitions and `docs/audit_v0.2.md` for what changed relative to v0.1.
 """
 
 from __future__ import annotations
 
 import csv
-from collections import defaultdict
-from pathlib import Path
-
 import sys
+from collections import OrderedDict
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from simulator.config import load_config, ROOT
-from simulator.events import ground_truth_events
-from simulator.metrics import compute_metrics
-from simulator.replay import load_dataset, run_all
+import pandas as pd
+
 from analysis import plots as P
+from simulator.config import ROOT, load_config
+from simulator.metrics import RunMetrics, aggregate_micro, compute_run_metrics
+from simulator.replay import RunResult, load_scenario, run_all
 
 RESULTS = ROOT / "results"
 
+# One row per sample. The same schema is used for every strategy so the logs
+# are directly comparable; a fixed-rate strategy fills `state` with its own
+# name and leaves `score` empty (it has no change score).
+SAMPLE_FIELDS = [
+    "timestamp",
+    "temperature",
+    "humidity",
+    "pressure",
+    "light",
+    "state",
+    "interval_s",
+    "score",
+    "upload_requested",
+    "detected_event",
+]
 
-def _mark_scenario(path: Path) -> str:
-    # scenario_a_stable.csv -> "A"
-    return path.stem.split("_")[-2].lower() if path.stem.startswith("scenario_") else path.stem
+
+def parse_scenario_name(path: Path) -> Tuple[str, str, str]:
+    """`scenario_b_sudden.csv` -> ("b", "sudden", "B: sudden")."""
+    parts = path.stem.split("_")
+    if len(parts) >= 3 and parts[0] == "scenario":
+        letter = parts[1]
+        name = " ".join(parts[2:])
+        return letter, name, f"{letter.upper()}: {name}"
+    return path.stem, path.stem, path.stem
 
 
-def write_sample_logs(name: str, runs, out_root: Path) -> None:
-    """Persist sampled (and, for adaptive, full decision) streams as CSV."""
-    scenario_dir = out_root / "sim" / name
-    scenario_dir.mkdir(parents=True, exist_ok=True)
-    for res in runs:
-        path = scenario_dir / f"{res.strategy}.csv"
-        with open(path, "w", newline="", encoding="utf-8") as fh:
-            if res.strategy == "AdaptiveSense":
-                fieldnames = ["timestamp", "temperature", "humidity", "pressure",
-                              "light", "state", "interval_s", "score", "upload", "detected_event"]
-            else:
-                fieldnames = ["timestamp", "temperature", "humidity", "pressure", "light", "upload"]
-            w = csv.DictWriter(fh, fieldnames=fieldnames)
-            w.writeheader()
-            for d in res.decisions:
-                w.writerow({
-                    "timestamp": round(d.timestamp, 3), "temperature": d.values["temperature"],
-                    "humidity": d.values["humidity"], "pressure": d.values["pressure"],
-                    "light": d.values["light"], "state": d.state,
-                    "interval_s": d.interval_s, "score": round(d.score, 4),
-                    "upload": int(d.upload), "detected_event": int(d.detected_event),
-                })
-            for s in res.samples:
-                w.writerow({**{"timestamp": round(s["timestamp"], 3), **{k: s[k] for k in fieldnames if k in s}}})
+def write_sample_log(path: Path, res: RunResult, strategy_interval: float | None) -> None:
+    """Persist the sampled stream of one strategy — exactly one row per sample.
+
+    v0.1 wrote the decision stream *and* the sample stream for AdaptiveSense,
+    which duplicated every timestamp; the decision fields are now merged into
+    the sampled row instead.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=SAMPLE_FIELDS)
+        w.writeheader()
+        for i, sample in enumerate(res.samples):
+            decision = res.decisions[i] if i < len(res.decisions) else None
+            row: Dict[str, object] = {
+                "timestamp": round(float(sample["timestamp"]), 3),
+                "temperature": sample["temperature"],
+                "humidity": sample["humidity"],
+                "pressure": sample["pressure"],
+                "light": sample["light"],
+            }
+            if decision is not None:
+                row.update(
+                    state=decision.state,
+                    interval_s=decision.interval_s,
+                    score=round(decision.score, 4),
+                    upload_requested=int(decision.upload_requested),
+                    detected_event=int(decision.detected_event),
+                )
+            else:  # fixed-rate baseline: samples == uploads, no change score
+                row.update(
+                    state="FIXED",
+                    interval_s=strategy_interval if strategy_interval else "",
+                    score="",
+                    upload_requested=1,
+                    detected_event=0,
+                )
+            w.writerow(row)
 
 
 def main() -> None:
@@ -72,64 +108,91 @@ def main() -> None:
     dataset_dir = ROOT / cfg["dataset"]["raw_dir"]
     scenarios = sorted(dataset_dir.glob("scenario_*.csv"))
     if not scenarios:
-        print(f"No datasets under {dataset_dir}. Generate them first:\n"
-              f"  python dataset/generate_dataset.py")
+        print(
+            f"No datasets under {dataset_dir}. Generate them first:\n"
+            f"  python dataset/generate_dataset.py"
+        )
         return
 
-    all_rows = []
-    agg = defaultdict(list)
+    eval_cfg = cfg["evaluation"]
+    tolerance = float(eval_cfg["event_match_tolerance_s"])
+    payload_bytes = float(cfg["adaptive"]["energy"]["payload_bytes_per_upload"])
+    energy_units = float(cfg["adaptive"]["energy"]["communication_energy_units_per_upload"])
+
+    runs_by_strategy: "OrderedDict[str, List[RunMetrics]]" = OrderedDict()
+    all_rows: List[Dict[str, object]] = []
+    scenarios_no_events: List[str] = []
+
+    print(f"Event matching tolerance: {tolerance} s (channel-aware, one-to-one)")
+    print()
 
     for path in scenarios:
-        times, rows = load_dataset(path)
-        name = _mark_scenario(path)
-        scenario_label = f"Scenario {name.upper()}-{path.stem.split('_')[-1]}"
-        gt_events = ground_truth_events(rows, times, cfg)
+        letter, name, label = parse_scenario_name(path)
+        times, rows, gt_events = load_scenario(path, cfg)
+        duration_s = times[-1] - times[0] if times else 0.0
         runs = run_all(times, rows, cfg)
-        write_sample_logs(path.stem, runs, RESULTS)
 
-        duration_s = times[-1] - times[0]
-        n_gt = len(rows)
+        if not gt_events:
+            scenarios_no_events.append(label)
+        print(
+            f"{label:22s} {len(rows):6d} rows  {len(gt_events):2d} GT events  "
+            f"({duration_s / 60.0:.0f} min)"
+        )
+
         for res in runs:
-            m = compute_metrics(
+            write_sample_log(
+                RESULTS / "sim" / path.stem / f"{res.strategy}.csv",
+                res,
+                res.fixed_interval_s,
+            )
+
+            m = compute_run_metrics(
                 strategy_name=res.strategy,
-                n_ground_truth=n_gt,
-                samples_taken=len(res.samples),
+                scenario=letter,
+                scenario_label=label,
+                sample_timestamps=res.sample_timestamps,
+                n_ground_truth=len(rows),
                 uploads=len(res.uploads),
-                n_gt_events=len(gt_events),
                 gt_events=gt_events,
                 detected=res.detected,
                 duration_s=duration_s,
-                payload_bytes=cfg["adaptive"]["energy"]["payload_bytes_per_upload"],
-                energy_per_upload_mj=cfg["adaptive"]["energy"]["energy_per_upload_mj"],
+                payload_bytes=payload_bytes,
+                energy_units_per_upload=energy_units,
+                match_tolerance_s=tolerance,
             )
-            row = {
-                "scenario": name,
-                "scenario_label": scenario_label,
-                **m,
-            }
-            all_rows.append(row)
-            agg[res.strategy].append(m)
+            runs_by_strategy.setdefault(res.strategy, []).append(m)
+            all_rows.append(m.csv_row())
 
-    # ---- write metrics to CSV --------------------------------------------
+    # ---- per-scenario metrics -------------------------------------------
     RESULTS.mkdir(parents=True, exist_ok=True)
     metrics_path = RESULTS / "metrics_all.csv"
-    fieldnames = list(all_rows[0].keys())
     with open(metrics_path, "w", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=fieldnames)
+        w = csv.DictWriter(fh, fieldnames=list(all_rows[0].keys()))
         w.writeheader()
         w.writerows(all_rows)
-    print(f"Wrote per-run metrics -> {metrics_path}")
+    print(f"\nWrote per-scenario metrics -> {metrics_path}")
 
-    # ---- averaged summary table ------------------------------------------
-    import pandas as pd
+    # ---- micro-aggregated overall metrics --------------------------------
+    summary_rows = [aggregate_micro(runs) for runs in runs_by_strategy.values()]
+    summary_path = RESULTS / "metrics_summary.csv"
+    summary_fields = list(
+        dict.fromkeys(k for row in summary_rows for k in row.keys())
+    )
+    with open(summary_path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=summary_fields)
+        w.writeheader()
+        w.writerows(summary_rows)
+    print(f"Wrote micro-aggregated summary -> {summary_path}")
+
+    if scenarios_no_events:
+        print(
+            "Scenarios with zero ground-truth events (reported as N/A, never 0%): "
+            + ", ".join(scenarios_no_events)
+        )
 
     df = pd.DataFrame(all_rows)
-    summary = df.groupby("strategy", sort=False).mean(numeric_only=True).reindex(list(agg))
-    summary_path = RESULTS / "metrics_summary.csv"
-    summary.to_csv(summary_path)
-    print(f"Wrote strategy-averaged summary -> {summary_path}")
-
-    P.render_all(df)
+    summary_df = pd.DataFrame(summary_rows)
+    P.render_all(df, summary_df)
     print(f"Wrote plots -> {RESULTS / 'plots'}")
 
 

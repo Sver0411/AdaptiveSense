@@ -1,111 +1,130 @@
 # Methodology
 
-## Research question
+The normative definition of the algorithm is
+[`change_score_spec.md`](change_score_spec.md). That file is the specification;
+this one explains how the experiment around it is run and how the numbers in
+`results/` are produced.
 
-> Can change-aware adaptive sampling reduce sensing and communication overhead on
-> resource-constrained IoT devices while preserving event-detection performance?
+## Hypothesis
 
-The hypothesis:
+- When the environment is stable, the node can sample and transmit much less.
+- When change increases, the sampling rate should increase — promptly.
+- Sustained events should still be detected.
+- Therefore: comparable detection at lower cost.
 
-  - when the environment is stable, the node can sample and transmit *much* less
-  - when change increases, the sampling rate increases dynamically
-  - sustained events are detected reliably
-  - thus: same event detection → less work → less energy use.
+The simulation results in the README show this holds *partially*: the cost
+reduction is large (97.1 % fewer uploads) but detection is not preserved in every
+scenario, and the policy lands on the fixed-rate trade-off curve rather than above
+it.
 
-## Algorithm
+## Where the algorithm is defined
 
-### Change-awareness is built on two components:
+| run-time | files |
+|----------|-------|
+| offline scheduler | `simulator/scoring.py` (score), `simulator/adaptive.py` (policy) |
+| on-device policy | `firmware/main/change_detector.c`, `firmware/main/adaptive_scheduler.c` |
+| host-side reference build | the two C files above, compiled for the host |
 
-1. **Per-channel instability scoring**. For each sensor reading, the code
-   calculates a score that is the maximum over three different change
-   indicators, all normalised by that channel's typical noise:
+`simulator/scoring.py` is the **only** Python implementation of the score, and
+both the live scheduler and the offline detector call it. In v0.1 the score
+existed in three places with three different definitions of the rate-of-change
+term; that is now structurally impossible.
 
-   - `dev = |current - EMA baseline| / noise_floor`
-   - `std = rolling_window_standard_deviation / noise_floor`
-   - `roc = recent_mean_abs_delta / noise_floor`
-   - `score = max(dev, std, roc)`
+## Baselines
 
-   The EMA baseline is kept forever (i.e. `alpha = dt / (dt + tau)`), so a
-   change after a long stable interval is still detected properly (the baseline
-   doesn't get forgotten, unlike a strict fixed window).
+Five fixed-period strategies — Fixed-5s, Fixed-10s, Fixed-20s, Fixed-40s,
+Fixed-60s. Each samples and uploads at a constant interval, so it represents the
+"sample less" answer with no change awareness at all.
 
-2. **Three-state machine with hysteresis**. The total score (max over channels)
-   is used to update state:
+## Ground truth
 
-   - **STABLE**: score < `stable_threshold` (relative hysteresis). The
-     gradually increases the interval: 20 → 40 → 60 s.
-   - **ACTIVE**: score between stable and active thresholds. Interval decreases
-     steadily from 60 → 30 → 15 → 5 s.
-   - **ALERT**: score > `active_threshold`. Interval is always 5 s (maximum
-     sampling rate).
+Ground truth comes from `dataset/generate_dataset.py`, not from the scoring code.
+The generator knows which interval it drove which channel over, so it can label
+events from its own **noise-free** driven signal with an absolute rule:
 
-   Relative hysteresis is applied: the lower/upper bands for transitions are
-   shifted by the hysteresis fraction to prevent rapid oscillation near the
-   thresholds.
+```
+an interval is an event on channel c iff
+    |driven_offset_c(t)| >= gt_label_min_deviation[c]  continuously for at least
+    gt_label_min_duration_s seconds
+```
 
-3. **Upload policy**: A sample is transmitted if:
+`gt_label_min_deviation` is in physical units (°C, %RH, hPa, lux) and is
+deliberately *not* the policy's noise floor, so AdaptiveSense cannot influence
+what counts as an event. Labels are committed under `dataset/labels/`.
 
-   - it is the first sample after an event is detected,
-   - the state just changed,
-   - the interval just changed,
-   - it has been `heartbeat_s` seconds since the last upload (periodic heartbeat),
-   - the signal has changed more than `delta_threshold` from the last upload
-     even if no state change.
+v0.1 instead ran the AdaptiveSense score over the full-resolution signal to
+produce the "ground truth". A strategy was then evaluated on whether it could
+reproduce the output of its own scoring function, which is circular and is why
+that revision could report perfect detection.
 
-4. **Event detection**: an event is flagged when the score stays above
-   `event_threshold` for at least `event_min_duration_s` (debouncing).
+## Matching and aggregation
 
-All parameters are collected in `experiments/experiment_config.yaml` for Python
-and mirrored in the firmware via `firmware/main/config.h`. Changing the
-configuration does not require touching any code.
+Channel-aware, one-to-one matching
+([`change_score_spec.md` §11](change_score_spec.md)), with the tolerance in
+`evaluation.event_match_tolerance_s`. Per-scenario rates are reported as `N/A`
+when the scenario contains no labelled event. Overall numbers are micro
+aggregates: `sum(TP)/sum(GT)`, pooled counts, and latency recomputed over the
+pooled matched-pair list.
 
-## Baselines compared
+## Cost accounting
 
-Five fixed-interval strategies:
+| column | meaning |
+|--------|---------|
+| `number_of_samples` | readings the node would take |
+| `number_of_uploads` | packets the policy requested |
+| `estimated_payload_bytes` | uploads × configured payload size |
+| `communication_energy_proxy` | uploads × a configured dimensionless constant |
 
-- Fixed-5s
-- Fixed-10s
-- Fixed-20s
-- Fixed-40s
-- Fixed-60s
+No physical energy unit is reported. `communication_energy_proxy` is an invented
+constant and is only meaningful for comparing strategies within one run.
 
-## Metrics
+## `upload_requested` is not `publish_success`
 
-Every strategy is evaluated on the same ground-truth data. Metrics:
+The policy decides whether a sample *should* be transmitted
+(`upload_requested`). The transport layer decides whether it *was*
+(`publish_success`). On device these are logged and counted separately:
 
-| metric | definition |
-|--------|------------|
-| `number_of_samples` | how many readings the node would take |
-| `sampling_reduction` | `1 - samples / full_ground_truth_samples` |
-| `number_of_uploads` | how many packets transmitted |
-| `communication_reduction` | `1 - uploads / full_ground_truth_samples` |
-| `average_sampling_interval_s` | mean interval between samples |
-| `event_detection_rate` | fraction of ground-truth events that were detected |
-| `missed_events` | count of ground-truth events not detected |
-| `false_positive_events` | count of detected events that do not overlap any ground-truth event |
-| `false_positive_per_hour` | false positives per hour of observation |
-| `avg_detection_latency_s` | average time from gt event onset to first overlapping detected event |
-| `median_detection_latency_s` | median detection latency |
-| `energy_proxy_mj` | number of uploads × configurable constant per upload (**proxy only**) |
+```
+cycle=12 t=220.0 state=1 interval=15.0s score=6.71 event=0 \
+upload_requested=1 publish_success=1 temp=25.02 hum=44.88
+```
 
-All energy estimates currently rely on this proxy measurement. Real hardware
-energy measurements should be measured and reported separately as per
-docs/hardware.md.
+```
+I (…) comm: publish stats: requested=152 ok=148 failed=4 mqtt_connected=1
+```
+
+The scheduler's upload baseline follows the *decision*, not the transport
+outcome, so that the offline simulator and the device run the same policy; this
+is what the Python/C parity test checks. A non-zero `publish_failed` with the
+counters visible in the log is what makes a dead broker diagnosable — in v0.1 a
+disconnected broker was indistinguishable from "nothing to send".
 
 ## MQTT payload schema
-
-The JSON payload transmitted over MQTT matches:
 
 ```json
 {
   "device_id": "node-01",
   "timestamp": 123456,
-  "temperature": 24.1,
-  "humidity": 45.2,
-  "pressure": 1012.2,
+  "temperature": 24.10,
+  "humidity": 45.20,
+  "pressure": 1012.20,
   "light": 320.0,
-  "sampling_interval": 20,
+  "sampling_interval": 20.0,
   "state": "STABLE",
   "event": false
 }
 ```
+
+## Known measurement weaknesses
+
+Recorded here rather than buried in the results:
+
+1. 24 labelled events over 26 400 s is a small benchmark.
+2. Scenario F deliberately uses a noise amplitude ~7× the configured temperature
+   noise floor, which is a mis-parameterisation the policy cannot absorb. It is
+   the source of most false alarms for *every* strategy.
+3. The detected-event rule is threshold-and-debounce, so a "detection" means the
+   score crossed a threshold for long enough — not that a change point was
+   located.
+4. Parameters are hand-selected and known not to be jointly optimal; see
+   limitation 6 in the README.

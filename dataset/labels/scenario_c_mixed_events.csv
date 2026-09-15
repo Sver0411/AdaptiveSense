@@ -1,0 +1,5 @@
+channel,start_s,end_s,event_type
+temperature,3302,4800,sudden_change
+humidity,3303,4655,sudden_change
+temperature,5944,6840,sudden_change
+humidity,5946,6666,sudden_change

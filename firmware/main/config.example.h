@@ -6,11 +6,17 @@
  *
  *     cp firmware/main/config.example.h firmware/main/config.h
  *
- * config.h is deliberately ignored by git (see .gitignore) so that real
- * Wi-Fi passwords and MQTT credentials are never committed.
+ * (firmware/main/CMakeLists.txt does this automatically if config.h is
+ * missing.) config.h is ignored by git so that real Wi-Fi passwords and MQTT
+ * credentials are never committed.
  *
- * NOTE: these constants mirror experiments/experiment_config.yaml so that
- * on-device behaviour matches the offline replay simulator.
+ * IMPORTANT: the algorithm constants below mirror
+ * `experiments/experiment_config.yaml` value for value. They are the ONLY
+ * definition of the on-device parameters; nothing is hardcoded in the C sources.
+ * `scripts/check_config_parity.py` fails if the two files drift apart, and it
+ * runs in CI.
+ *
+ * The behaviour these values drive is specified in docs/change_score_spec.md.
  */
 #ifndef ADAPTIVESENSE_CONFIG_H
 #define ADAPTIVESENSE_CONFIG_H
@@ -24,27 +30,38 @@
 #define CONFIG_AS_DEVICE_ID       "node-01"   /* reported in MQTT payload */
 #define CONFIG_AS_WIFI_SSID       "your-wifi" /* REPLACE */
 #define CONFIG_AS_WIFI_PASS       "your-pass" /* REPLACE */
-#define CONFIG_AS_WIFI_MAX_RETRY  20
 
 /* ------------------------------------------------------------------ */
-/* MQTT broker (REPLACE with your own; never commit live credentials)  */
+/* MQTT broker (REPLACE with your own; never commit live credentials)   */
 /* ------------------------------------------------------------------ */
 #define CONFIG_AS_MQTT_URI        "mqtt://localhost:1883"
 #define CONFIG_AS_MQTT_USER       ""          /* leave empty if none    */
 #define CONFIG_AS_MQTT_PASS       ""          /* leave empty if none    */
 #define CONFIG_AS_MQTT_TOPIC      "adaptivesense/data"
 #define CONFIG_AS_MQTT_QOS        0
+#define CONFIG_AS_MQTT_KEEPALIVE_S 30         /* must exceed the sleep time or
+                                                 the broker drops the session */
 
 /* ------------------------------------------------------------------ */
 /* Sensor (BME280 over I2C) / mock                                     */
 /* CONFIG_AS_USE_MOCK_SENSOR forces a deterministic fake sensor that    */
-/* mirrors dataset/ so the firmware logic can be exercised without HW. */
+/* mirrors dataset/ so the firmware logic can be exercised without HW.  */
 /* ------------------------------------------------------------------ */
 #define CONFIG_AS_USE_MOCK_SENSOR     0
 #define CONFIG_AS_SENSOR_SDA_GPIO     4
 #define CONFIG_AS_SENSOR_SCL_GPIO     5
 #define CONFIG_AS_I2C_FREQ_HZ         400000
 #define CONFIG_AS_BME280_I2C_ADDR     0x76   /* or 0x77 */
+
+/* Forced-mode measurement timing (see firmware/main/sensor.c).
+ * At oversampling x1/x1/x1 the datasheet's worst-case conversion time is well
+ * under 20 ms; MEAS_SETTLE_MS lets the `measuring` status bit be asserted
+ * before polling starts, and MEAS_TIMEOUT_MS is a hard upper bound on the
+ * wait. The driver never blocks indefinitely. */
+#define CONFIG_AS_BME280_MEAS_SETTLE_MS  2
+#define CONFIG_AS_BME280_MEAS_TIMEOUT_MS 50
+/* Hard timeout for every I2C transaction. */
+#define CONFIG_AS_I2C_TIMEOUT_MS         100
 
 /* ------------------------------------------------------------------ */
 /* Adaptive sampling parameters (mirror experiments/experiment_config) */
@@ -53,7 +70,8 @@
 #define CONFIG_AS_DEFAULT_INTERVAL_S  20
 #define CONFIG_AS_MAX_INTERVAL_S      60
 
-/* Channel noise floors (used to normalise the instability score).    */
+/* Channel noise floors. Used both to normalise the instability score and to
+ * normalise the upload delta. */
 #define CONFIG_AS_NOISE_FLOOR_TEMP    0.15f  /* deg C */
 #define CONFIG_AS_NOISE_FLOOR_HUM     0.80f  /* %RH   */
 #define CONFIG_AS_NOISE_FLOOR_PRESS   0.30f  /* hPa   */
@@ -62,42 +80,77 @@
 #define CONFIG_AS_USE_PRESSURE        0
 #define CONFIG_AS_USE_LIGHT           1
 
-/* Analyzer windows (seconds).                                       */
+/* Analyzer windows (seconds), matching adaptive.analyzer in the YAML.
+ * roc_window_s must not exceed variety_window_s. */
 #define CONFIG_AS_VARIETY_WINDOW_S    30
 #define CONFIG_AS_ROC_WINDOW_S        10
 #define CONFIG_AS_BASELINE_TAU_S      60
 
-/* State-machine thresholds (multiples of noise floor) + hysteresis.  */
+/* State-machine thresholds (multiples of the noise floor) + hysteresis. */
 #define CONFIG_AS_STABLE_THRESHOLD    3.0f
 #define CONFIG_AS_ACTIVE_THRESHOLD    8.0f
 #define CONFIG_AS_HYSTERESIS_FRACTION 0.5f
 
-/* Interval ladders per state (seconds).                             */
+/* Interval ladders per state (seconds).
+ *
+ *   STABLE ascends (sample less when nothing happens)
+ *   ACTIVE descends (sample faster while the environment is moving)
+ *   ALERT  is fixed at the minimum interval
+ *
+ * v0.1 had `{ 60, 30, 15, 5 }` for ACTIVE, so the node waited 60 s immediately
+ * after detecting change. Do not restore that ordering:
+ * scripts/check_config_parity.py checks the ladder values, and
+ * simulator/config.py rejects a ladder that is not monotone in the right
+ * direction.
+ */
 #define CONFIG_AS_LADDER_STABLE       { 20, 40, 60 }
-#define CONFIG_AS_LADDER_ACTIVE       { 60, 30, 15, 5 }
+#define CONFIG_AS_LADDER_ACTIVE       { 15, 10, 5 }
 #define CONFIG_AS_LADDER_ALERT        { 5 }
 
-/* Event detection.                                                  */
-#define CONFIG_AS_EVENT_THRESHOLD     8.0f
+/* Evaluations spent on a ladder rung before advancing to the next one. */
+#define CONFIG_AS_LADDER_CONFIRM_STABLE 2
+#define CONFIG_AS_LADDER_CONFIRM_ACTIVE 1
+#define CONFIG_AS_LADDER_CONFIRM_ALERT  1
+
+/* Event detection. */
+#define CONFIG_AS_EVENT_THRESHOLD      8.0f
 #define CONFIG_AS_EVENT_MIN_DURATION_S 10
 
-/* Upload policy.                                                    */
-#define CONFIG_AS_UP_ON_EVENT         1
-#define CONFIG_AS_UP_ON_STATE_CHANGE  1
+/* Upload policy. */
+#define CONFIG_AS_UP_FIRST_SAMPLE      1
+#define CONFIG_AS_UP_ON_EVENT          1
+#define CONFIG_AS_UP_ON_STATE_CHANGE   1
 #define CONFIG_AS_UP_ON_INTERVAL_CHANGE 1
-#define CONFIG_AS_UP_HEARTBEAT_S      60
-#define CONFIG_AS_UP_DELTA_THRESHOLD  2.0f
+#define CONFIG_AS_UP_HEARTBEAT_S       60
+#define CONFIG_AS_UP_DELTA_THRESHOLD   2.0f
 
 /* ------------------------------------------------------------------ */
 /* Power management                                                    */
 /* ------------------------------------------------------------------ */
-/* Wake = sample = evaluate = maybe transmit, then deep sleep for the  */
-/* remaining time until the next scheduled sample.                     */
-#define CONFIG_AS_DEEP_SLEEP_ENABLE   1
-#define CONFIG_AS_WAKE_GPIO_ENABLE    0    /* external wake source */
-#define CONFIG_AS_WORK_CYCLE_NOTE     "see docs/power_management.md"
+/* 0 = none   : FreeRTOS vTaskDelay; radio stays up. Use for bench work.
+ * 1 = light  : esp_light_sleep_start(); RAM + Wi-Fi association retained.
+ *              DEFAULT.
+ * 2 = deep   : esp_deep_sleep_start(). Rejected below: deep sleep reboots the
+ *              chip, so the change-detector EMA baselines, the ladder position
+ *              and the event debounce state would all be lost. Persisting them
+ *              in RTC memory is out of scope for v0.2 (see README limitations).
+ *
+ * v0.1 had a boolean CONFIG_AS_DEEP_SLEEP_ENABLE guarding a *light* sleep call,
+ * so the name did not describe the behaviour.
+ */
+#define CONFIG_AS_SLEEP_MODE 1
 
-/* Max channel count handled by the fixed-size analyzers.             */
-#define CONFIG_AS_MAX_CHANNELS        4
+/* Wi-Fi modem-sleep power save is enabled once at start-up by
+ * communication_start() (WIFI_PS_MIN_MODEM). The radio is never stopped
+ * between samples, so the MQTT session survives the light sleeps. */
+#define CONFIG_AS_WIFI_MODEM_SLEEP_ENABLE 1
+
+#if CONFIG_AS_SLEEP_MODE == 2
+#error "CONFIG_AS_SLEEP_MODE=2 (deep sleep) is experimental in v0.2: the adaptive scheduler state is not persisted across the reboot. Use 0 (none) or 1 (light sleep)."
+#endif
+
+#if CONFIG_AS_SLEEP_MODE != 0 && CONFIG_AS_SLEEP_MODE != 1 && CONFIG_AS_SLEEP_MODE != 2
+#error "CONFIG_AS_SLEEP_MODE must be 0 (none), 1 (light) or 2 (deep)"
+#endif
 
 #endif /* ADAPTIVESENSE_CONFIG_H */

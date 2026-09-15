@@ -1,95 +1,138 @@
 # Architecture
 
-AdaptiveSense is organised as a layered system. The same core algorithm appears
-in two "run-times":
+AdaptiveSense has one algorithm and three places it runs:
 
-1. an **offline replay simulator** (Python) that evaluates the policy on
-   labelled ground-truth data and produces metrics and figures, and
-2. an **on-device firmware** (ESP-IDF C) that runs the identical policy in real
-   time on an ESP32-S3.
+1. the **offline replay simulator** (Python) used to evaluate the policy,
+2. the **on-device firmware** (ESP-IDF C) that runs it in real time on an
+   ESP32-S3, and
+3. a **host-side reference build** of the same C policy files, used only by the
+   Python/C parity test.
 
-Because both share the same scoring/state-machine logic, simulator results are
-predictive of on-device behaviour.
+All three follow [`change_score_spec.md`](change_score_spec.md).
+`tests/test_parity_python_c.py` compiles `change_detector.c`,
+`adaptive_scheduler.c` and `policy_config.c` for the host and asserts that
+`simulator/adaptive.py` and the firmware produce identical state, interval, event
+and upload decisions on a shared fixture.
 
 ## System diagram
 
 ```mermaid
 flowchart LR
-    subgraph Node["ESP32-S3 node"]
-        SEN[Sensor layer<br/>BME280/BH1750 I2C] --> CD[Change-detection layer<br/>instability score + events]
-        CD --> AS[Adaptive sampling layer<br/>state / interval / upload]
-        AS --> COMM[Communication layer<br/>Wi-Fi + MQTT]
-        AS --> PM[Power-management layer<br/>light/deep sleep]
+    subgraph Node["ESP32-S3 node (firmware/)"]
+        SEN["sensor.c + bme280_math.c<br/>BME280 I2C, forced mode"] --> CD["change_detector.c<br/>score + debounced event"]
+        CD --> AS["adaptive_scheduler.c<br/>state / interval / upload"]
+        AS --> COMM["communication.c<br/>Wi-Fi + MQTT"]
+        AS --> PM["power_mgmt.c<br/>none / light sleep"]
         PM --> SEN
-        PM --> AS
     end
-    SENSORS["Physical sensors"] --> SEN
     COMM -->|MQTT JSON| BROKER[(MQTT broker)]
-    BROKER --> COLLECT[server/ mqtt_collector.py]
-    COLLECT --> RESLOG[results/live/ node log]
+    BROKER --> COLLECT[server/mqtt_collector.py]
+    COLLECT --> LIVE[(results/live/)]
 
     subgraph Analysis["Offline pipeline"]
-        DAT[(dataset/raw CSV 1 Hz)] --> REPLAY[simulator/replay.py]
-        REPLAY --> MET[simulator/metrics.py]
+        RAW[(dataset/raw 1 Hz)] --> REPLAY[simulator/replay.py]
+        LAB[(dataset/labels)] --> MET[simulator/metrics.py]
+        REPLAY --> MET
         MET --> ANA[analysis/analyze.py]
-        ANA --> RES[(results/ metrics + plots)]
+        ANA --> RES[(results/)]
     end
 ```
 
 ## Layering
 
-### Sensor layer (`firmware/main/sensor.c|h`)
-Abstracts the transducer(s) behind `sensor_read()` returning a temperature /
-humidity / pressure / light vector with per-channel validity flags. Two
-implementations: a register-level BME280 I2C driver and a clearly-labelled mock
-sensor for hardware-free bring-up.
+### Sensor layer — `sensor.c`, `bme280_math.c`, `sensor.h`
 
-### Change-detection layer (`firmware/main/change_detector.c|h`)
-Turns a stream of measurements into a **normalised instability score** per
-channel and a debounced **event** bit. It keeps a small time-windowed history
-per channel (for variance and rate-of-change) plus a persistent EMA change
-baseline so a real change is not forgotten when the sampling interval is long.
+`bme280_math.c` is pure C99 with no ESP-IDF dependency: calibration parsing, raw
+register decoding and the vendor compensation equations, all host-testable.
+`sensor.c` owns I²C transport, chip bring-up, the forced-mode measurement
+sequence with its bounded wait, and the mapping into `sensor_read_t`. Splitting
+the maths out is what allows `tests/test_bme280_math.py` to verify the driver
+without a board.
+
+### Change-detection layer — `change_detector.c`, `change_detector.h`
+
+Turns a stream of measurements into a normalised instability score per channel
+and a debounced event bit. Per channel it keeps a time-ordered history bounded by
+the variety window plus a persistent EMA baseline. Windows and thresholds are
+runtime fields of `cd_config_t` — nothing is a compile-time constant — and the
+history ring is sized from the configuration rather than guessed.
+
+Mirrors `simulator/scoring.py`.
+
+### Adaptive-sampling layer — `adaptive_scheduler.c`, `adaptive_scheduler.h`
+
+Pure policy. From the score and the event flag it drives the
+STABLE/ACTIVE/ALERT state machine with hysteresis, walks the per-state interval
+ladder, and decides whether this sample should be uploaded. It holds no reference
+to any sensor, radio or timing driver — which is why it compiles on a host.
+
 Mirrors `simulator/adaptive.py`.
 
-### Adaptive sampling layer (`firmware/main/adaptive_scheduler.c|h`)
-Pure policy. From the score and event flag it drives a STABLE / ACTIVE / ALERT
-state machine with hysteresis, walks a per-state interval ladder to choose the
-next sampling interval, and decides whether to upload this sample. Holds no
-reference to any sensor or radio driver.
+### Communication layer — `communication.c`, `communication.h`
 
-### Communication layer (`firmware/main/communication.c|h`)
-`esp_mqtt` wrapper that publishes a compact JSON payload per upload.
-Credentials are read from the git-ignored `config.h`; the committed
-`config.example.h` contains only placeholders.
+Wi-Fi bring-up, the modem-sleep power save, and a thin esp-mqtt wrapper that
+publishes one JSON payload per requested upload. Every publish attempt is counted
+and its outcome returned, so `upload_requested` and `publish_success` are
+distinguishable in the log.
 
-### Power-management layer (`firmware/main/power_mgmt.c|h`)
-Provides `power_sleep()` (measurable light sleep) and `power_deep_sleep()`
-(power-optimal, non-returning). It is deliberately decoupled from the adaptive
-scheduler so alternative power policies can be compared without touching the
-sampling policy.
+### Power-management layer — `power_mgmt.c`, `power_mgmt.h`
+
+`power_sleep()` (mode-configurable, returns the measured elapsed time) and
+`power_deep_sleep()` (documented primitive, rejected by the default
+configuration). Decoupled from the policy so power strategies can be compared
+without touching scheduling. It never stops the radio — see
+[power_management.md](power_management.md).
+
+### Configuration layer — `policy_config.c`, `policy_config.h`
+
+The one place where `CONFIG_AS_*` macros become `cd_config_t` / `as_config_t`.
+Because both `main.c` and the host-side parity harness call the same two
+functions, the parity test verifies the *device's* configuration rather than a
+copy of it. `scripts/check_config_parity.py` additionally checks that this file
+contains no numeric literals.
 
 ## Data / control flow (one duty cycle)
 
 ```
-WAKE
-  -> READ SENSOR
-  -> EVALUATE CHANGE           (score + event)
-  -> ADAPTIVE SCHEDULER         (state, interval, upload decision)
-  -> DECIDE UPLOAD             (publish MQTT if upload)
-  -> DETERMINE NEXT INTERVAL
-  -> SLEEP until next sample
+SLEEP until the scheduled sample time
+  → READ SENSOR                 (bounded forced-mode conversion)
+  → EVALUATE CHANGE             (score + debounced event)
+  → ADAPTIVE POLICY             (state, next interval, upload decision)
+  → PUBLISH if requested        (outcome recorded)
+  → DETERMINE NEXT WAKE
 ```
+
+A failed sensor read does **not** push a zeroed sample into the detector — the
+EMA baseline would be poisoned by the zeros. The node retries after
+`min_interval` instead.
+
+## Offline pipeline
+
+```
+dataset/raw/*.csv ──┐
+                    ├─> simulator/replay.py ──> RunResult (samples, uploads, decisions, detections)
+dataset/labels ─────┘                              │
+                                                   v
+                                      simulator/metrics.py (matching + metrics)
+                                                   │
+                                                   v
+                                      analysis/analyze.py ──> results/ + plots/
+```
+
+`simulator/replay.py` replays every strategy over the same signal;
+`dataset/labels/` supplies the ground truth and is never produced by the policy.
 
 ## Repository layout
 
 ```
 AdaptiveSense/
 ├── firmware/       ESP-IDF C application
-├── server/         MQTT data collector (Python)
-├── simulator/      offline replay simulator (Python)
-├── experiments/    central experiment config (YAML)
-├── analysis/       metrics tables + figures
-├── dataset/        ground-truth datasets + generator
-├── tests/          unit tests
-└── docs/           methodology & engineering docs
+├── simulator/      offline replay simulator + normative scoring
+├── dataset/        generator, raw signals, independent labels
+├── experiments/    central experiment configuration
+├── analysis/       metrics tables and figures
+├── scripts/        configuration parity check
+├── tests/          unit tests + host-side parity harness
+├── results/        simulation outputs
+└── docs/           specification, methodology, audit, engineering notes
 ```

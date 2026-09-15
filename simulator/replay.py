@@ -1,9 +1,13 @@
 """Offline replay simulator.
 
-Given a 1 Hz ground-truth dataset, replays *all* sampling strategies
-(Fixed-5/10/20/40/60 and AdaptiveSense) over the *same* ground-truth readings
-so results are directly comparable. Each strategy is treated as an isolated
-node that only ever observes the subset of readings it decided to sample.
+Given a 1 Hz dataset, replays *all* sampling strategies (Fixed-5/10/20/40/60 and
+AdaptiveSense) over the *same* ground-truth readings so results are directly
+comparable. Each strategy is treated as an isolated node that only ever observes
+the subset of readings it decided to sample.
+
+Ground-truth events are read from the independent label files produced by
+`dataset/generate_dataset.py`; they are never derived from the AdaptiveSense
+score (see `docs/change_score_spec.md` section 10).
 """
 
 from __future__ import annotations
@@ -11,12 +15,21 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from .adaptive import AdaptiveScheduler, Decision
-from .config import load_config, ROOT
-from .events import ground_truth_events
+from .config import ROOT, analyzer_config, load_config
+from .events import Event, detect_events, load_ground_truth_events
 from .fixed_sampling import run_fixed_strategy, strategy_name
+
+__all__ = [
+    "RunResult",
+    "load_dataset",
+    "load_scenario",
+    "run_adaptive",
+    "run_fixed",
+    "run_all",
+]
 
 
 @dataclass
@@ -24,17 +37,22 @@ class RunResult:
     """Everything one strategy produced on one scenario."""
 
     strategy: str
-    samples: List[Dict[str, float]] = field(default_factory=list)  # taken samples
-    uploads: List[Dict[str, float]] = field(default_factory=list)  # uploaded samples
-    decisions: List[Decision] = field(default_factory=list)
-    detected: List = field(default_factory=list)
+    samples: List[Dict[str, float]] = field(default_factory=list)
+    uploads: List[Dict[str, float]] = field(default_factory=list)
+    decisions: List[Optional[Decision]] = field(default_factory=list)
+    detected: List[Event] = field(default_factory=list)
+    # For a fixed-rate baseline: its constant interval. None for AdaptiveSense.
+    fixed_interval_s: Optional[float] = None
+
+    @property
+    def sample_timestamps(self) -> List[float]:
+        return [float(s["timestamp"]) for s in self.samples]
 
 
-def load_dataset(path: Path) -> Tuple[List[float], List[Dict[str, float]]]:
-    """Load a ground-truth CSV -> (timestamps, rows)."""
+def load_dataset(path: Path | str) -> Tuple[List[float], List[Dict[str, float]]]:
+    """Load a dataset CSV -> (timestamps, rows)."""
     with open(path, newline="", encoding="utf-8") as fh:
-        reader = csv.DictReader(fh)
-        rows = [dict(r) for r in reader]
+        rows = [dict(r) for r in csv.DictReader(fh)]
     times = [float(r["timestamp"]) for r in rows]
     for r in rows:
         for k in list(r.keys()):
@@ -44,30 +62,46 @@ def load_dataset(path: Path) -> Tuple[List[float], List[Dict[str, float]]]:
     return times, rows
 
 
-def _detect(samples: List[Dict[str, float]], cfg: dict):
-    """Detect sustained events from a sampled stream using the SAME function
-    and thresholds as ground-truth event extraction, but fed only the readings
-    the node actually observed."""
+def load_scenario(
+    raw_path: Path | str, cfg: dict
+) -> Tuple[List[float], List[Dict[str, float]], List[Event]]:
+    """Load a raw scenario together with its independent ground-truth labels."""
+    label_dir = ROOT / cfg["dataset"]["label_dir"]
+    times, rows = load_dataset(raw_path)
+    labels = load_ground_truth_events(raw_path, label_dir)
+    return times, rows, labels
+
+
+def _detect(samples: Sequence[Dict[str, float]], cfg: dict) -> List[Event]:
+    """Detect events from the samples a node actually observed.
+
+    Uses the documented change score only — the ground truth is not involved.
+    """
     if not samples:
         return []
-    times = [s["timestamp"] for s in samples]
-    rows = [{"timestamp": s["timestamp"], **{k: float(s[k]) for k in s if k != "timestamp"}}
-            for s in samples]
-    return ground_truth_events(rows, times, cfg)
+    return detect_events(list(samples), analyzer_config(cfg))
 
 
-def run_adaptive(times: List[float], rows: List[Dict[str, float]], cfg: dict) -> RunResult:
-    """Replay AdaptiveSense on the ground-truth series."""
+def run_adaptive(
+    times: List[float], rows: List[Dict[str, float]], cfg: dict
+) -> RunResult:
+    """Replay AdaptiveSense on the dataset.
+
+    The sampling loop mirrors `firmware/main/main.c`: a sample is taken when the
+    clock reaches the scheduled time, and the interval returned by the policy
+    schedules the *next* sample.
+    """
     res = RunResult(strategy="AdaptiveSense")
-    scheduler = AdaptiveScheduler(cfg, time=times[0] if times else 0.0)
+    if not times:
+        return res
 
-    next_sample = times[0] if times else 0.0
+    scheduler = AdaptiveScheduler(cfg, time=times[0])
+    next_sample = times[0]
     n = len(times)
-    i = 0
-    while i < n:
+
+    for i in range(n):
         t = times[i]
         if t < next_sample - 1e-9:
-            i += 1
             continue
         values = {k: rows[i][k] for k in rows[i] if k != "timestamp"}
         d = scheduler.update(t, values)
@@ -75,23 +109,23 @@ def run_adaptive(times: List[float], rows: List[Dict[str, float]], cfg: dict) ->
         sample = {"timestamp": t, **values}
         res.samples.append(sample)
         res.decisions.append(d)
-        if d.upload:
+        if d.upload_requested:
             res.uploads.append(sample)
         next_sample = t + d.interval_s
-        i += 1
 
     res.detected = _detect(res.samples, cfg)
     return res
 
 
-def run_fixed(times: List[float], rows: List[Dict[str, float]], interval: float, cfg: dict) -> RunResult:
-    """Replay a fixed-rate baseline."""
-    name = strategy_name(interval)
-    res = RunResult(strategy=name)
-    fixed = run_fixed_strategy(times, rows, interval)
-    for f in fixed:
+def run_fixed(
+    times: List[float], rows: List[Dict[str, float]], interval: float, cfg: dict
+) -> RunResult:
+    """Replay a fixed-rate baseline (samples == uploads; no change awareness)."""
+    res = RunResult(strategy=strategy_name(interval), fixed_interval_s=float(interval))
+    for f in run_fixed_strategy(times, rows, interval):
         sample = {"timestamp": f.timestamp, **f.values}
         res.samples.append(sample)
+        res.decisions.append(None)
         if f.upload:
             res.uploads.append(sample)
     res.detected = _detect(res.samples, cfg)
@@ -99,11 +133,9 @@ def run_fixed(times: List[float], rows: List[Dict[str, float]], interval: float,
 
 
 def run_all(
-    times: List[float],
-    rows: List[Dict[str, float]],
-    cfg: dict,
+    times: List[float], rows: List[Dict[str, float]], cfg: dict
 ) -> List[RunResult]:
-    """Run every strategy in the config over the given ground-truth series."""
+    """Run every strategy in the config over the given series."""
     results: List[RunResult] = []
     for interval in cfg["fixed_strategies"]:
         results.append(run_fixed(times, rows, float(interval), cfg))
@@ -116,16 +148,17 @@ if __name__ == "__main__":  # pragma: no cover - simple CLI
 
     cfg = load_config()
     dataset_dir = ROOT / cfg["dataset"]["raw_dir"]
-    if len(sys.argv) > 1:
-        targets = [Path(sys.argv[1])]
-    else:
-        targets = sorted(dataset_dir.glob("*.csv"))
+    targets = (
+        [Path(sys.argv[1])]
+        if len(sys.argv) > 1
+        else sorted(dataset_dir.glob("*.csv"))
+    )
     for path in targets:
-        times, rows = load_dataset(path)
-        print(f"== {path.name}: {len(rows)} rows ==")
+        times, rows, labels = load_scenario(path, cfg)
+        print(f"== {path.name}: {len(rows)} rows, {len(labels)} ground-truth events ==")
         for res in run_all(times, rows, cfg):
-            gt = ground_truth_events(rows, times, cfg)
-            det = res.detected if res.detected else []
-            print(f"  {res.strategy:16s}: samples={len(res.samples):6d} "
-                  f"uploads={len(res.uploads):6d} detected={len(det)}")
+            print(
+                f"  {res.strategy:16s}: samples={len(res.samples):6d} "
+                f"uploads={len(res.uploads):6d} detected={len(res.detected)}"
+            )
     print("Replay complete. Use analysis/analyze.py to compute full metrics.")

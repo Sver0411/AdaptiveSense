@@ -1,13 +1,16 @@
 /*
  * adaptive_scheduler.h — Adaptive Sampling Layer.
  *
- * Pure policy: given an instability score + event flag (produced by the
- * change-detection layer), it maintains the STABLE/ACTIVE/ALERT state machine,
- * selects the interval for the NEXT sample, and decides whether THIS sample
- * should be uploaded.
+ * Pure policy: given an instability score and an event flag (produced by the
+ * change-detection layer) it maintains the STABLE / ACTIVE / ALERT state
+ * machine, selects the interval for the NEXT sample, and decides whether THIS
+ * sample should be uploaded.
  *
- * The scheduler holds no reference to any sensor or communication driver, so
- * it can be unit-tested and reused under any power policy.
+ * Normative implementation of `docs/change_score_spec.md` sections 6-8. The
+ * Python counterpart is `simulator/adaptive.py`.
+ *
+ * The scheduler holds no reference to any sensor, radio or timing driver, so it
+ * can be unit-tested on the host and reused under any power policy.
  */
 #ifndef ADAPTIVESENSE_ADAPTIVE_SCHEDULER_H
 #define ADAPTIVESENSE_ADAPTIVE_SCHEDULER_H
@@ -18,6 +21,8 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+#define AS_NUM_CHANNELS 4
 
 typedef enum {
     AS_STABLE = 0,
@@ -31,56 +36,71 @@ typedef struct {
     float default_interval;
     float max_interval;
 
-    float stable_threshold;      /* multiples of noise floor */
+    float stable_threshold;      /* multiples of the noise floor */
     float active_threshold;
-    float hysteresis_fraction;
+    float hysteresis_fraction;   /* relative band on each boundary */
 
-    const float *ladders[AS_NUM_STATES]; /* per-state interval ladders */
+    /* Per-state interval ladders and how many consecutive evaluations are
+     * spent on a rung before advancing to the next one. */
+    const float *ladders[AS_NUM_STATES];
     size_t       ladder_len[AS_NUM_STATES];
+    int          ladder_confirm[AS_NUM_STATES];
 
     /* upload policy */
-    bool up_on_event;
-    bool up_on_state_change;
-    bool up_on_interval_change;
+    bool  up_first_sample;
+    bool  up_on_event;
+    bool  up_on_state_change;
+    bool  up_on_interval_change;
     float heartbeat_s;
     float delta_threshold;
 
-    bool delta_channel_use[4];   /* which channels take part in delta report */
+    /* normalized-delta reporting: per channel, which participate and the
+     * noise floor each delta is divided by (spec section 8). */
+    bool  delta_channel_use[AS_NUM_CHANNELS];
+    float delta_noise_floor[AS_NUM_CHANNELS];
 } as_config_t;
 
 typedef struct {
     as_state_t state;
-    float interval_s;            /* chosen interval for the NEXT sample */
-    bool detected_event;         /* event active at this sample */
-    bool upload;                 /* transmit this sample */
-    float score;                 /* normalised instability score */
+    float interval_s;       /* chosen interval for the NEXT sample */
+    bool  detected_event;   /* event active at this sample */
+    bool  upload_requested; /* this sample should be transmitted */
+    float score;            /* normalised instability score */
 } as_decision_t;
 
 typedef struct {
     const as_config_t *cfg;
     as_state_t state;
     float interval;
-    int  ladder_pos[AS_NUM_STATES];
 
-    /* upload / change bookkeeping */
+    int ladder_pos[AS_NUM_STATES];
+    int rung_count[AS_NUM_STATES];
+
+    unsigned long n_samples;
+
     double last_upload_t;
     bool   has_uploaded;
-    float  last_upload_values[4];
+    float  last_upload_values[AS_NUM_CHANNELS];
 
-    as_state_t last_state;
-    float      last_interval;
-    bool       event_potential;  /* reserved for future per-sample events */
+    float last_interval;
+    bool  prev_event_active;
 } as_t;
 
 void as_init(as_t *s, const as_config_t *cfg);
 
-/* Feed scored sample. caller supplies the measurement values (for delta
- * change-reporting), the instabilities across channels, the overall score, and
- * the event flag. timestamp is used for the heartbeat check and interval
- * selection is time-independent. */
+/*
+ * Feed one scored sample.
+ *
+ * `values` / `valid` supply the channel readings used by the normalized-delta
+ * upload rule; a channel with `valid[ch] == false` is skipped, which mirrors the
+ * Python policy's "channel not present in the sample" condition.
+ *
+ * `score` and `event` come from `cd_update()`. `timestamp` is used for the
+ * heartbeat check; interval selection itself is time-independent.
+ */
 void as_update(as_t *s, double timestamp,
-               const float values[4],
-               const float channel_scores[4],
+               const float values[AS_NUM_CHANNELS],
+               const bool valid[AS_NUM_CHANNELS],
                float score,
                bool event,
                as_decision_t *out);

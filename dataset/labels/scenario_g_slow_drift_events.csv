@@ -1,0 +1,3 @@
+channel,start_s,end_s,event_type
+temperature,1500,3300,sustained_change
+humidity,1800,3200,sustained_change

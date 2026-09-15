@@ -1,0 +1,68 @@
+name: Python tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: tests, analysis and reproducibility
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # The parity and BME280 tests compile the on-device C sources for the host,
+      # so a C compiler and the maths library must be present. build-essential is
+      # already on the runner image; this makes the requirement explicit.
+      - name: Ensure a host C compiler is available
+        run: |
+          cc --version
+          python -c "import shutil,sys; sys.exit(0 if shutil.which('cc') else 1)"
+
+      # The generator is seeded and the labels are written from the generator's
+      # own noise-free driven signal, so the datasets must regenerate byte for
+      # byte. `git diff --exit-code` after the analysis step is what turns that
+      # claim into a check.
+      - name: Regenerate the synthetic datasets
+        run: python dataset/generate_dataset.py
+
+      - name: Configuration parity (YAML <-> firmware config.h)
+        run: python scripts/check_config_parity.py
+
+      - name: Unit tests
+        run: python -m pytest tests/ -v
+
+      - name: Run the analysis pipeline
+        run: python analysis/analyze.py
+
+      - name: Results must be reproducible
+        run: |
+          if ! git diff --exit-code; then
+            echo "::error::Regenerating the datasets or rerunning the analysis changed tracked files."
+            echo "::error::The committed results must be exactly what the pipeline produces."
+            exit 1
+          fi
+
+      - name: Upload simulation results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: simulation-results
+          path: |
+            results/metrics_all.csv
+            results/metrics_summary.csv
+            results/plots/
+          if-no-files-found: warn

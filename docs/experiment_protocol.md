@@ -1,100 +1,120 @@
-# Experiment Protocol
+# Experiment protocol
 
-The protocol defines the procedure for collecting real data and reproducing the
-results from the paper.
+Procedure for the reported simulation study, and for collecting real data with
+the node so the same pipeline can be pointed at it.
 
 ## Prerequisites
 
-- ESP-IDF v5.0 or later, `idf.py` in the PATH.
-- Supported hardware: ESP32-S3 N16R8 (or any ESP32 with I2C + Wi-Fi).
-- BME280 temperature/humidity/pressure sensor connected to the I2C pins in
-  `config.h`.
-- MQTT broker running on the network reachable via Wi-Fi.
-- The Python analysis environment (`.venv`, `requirements.txt`).
+- Python 3.10+ with `requirements.txt` installed.
+- For the firmware: ESP-IDF v5.4, `idf.py` on `PATH`, and an ESP32-S3 N16R8
+  (or any ESP32 with I²C and Wi-Fi).
+- A BME280 wired to the I²C pins in `config.h`.
+- For a live campaign: an MQTT broker reachable over Wi-Fi, and a C compiler for
+  the host-side parity tests.
+- For energy work: a current monitor (see [hardware.md](hardware.md)).
 
-## Step 1: Ground-truth data collection
-
-To collect a real ground-truth dataset for the study:
-
-1. Flash the firmware with `CONFIG_AS_DEFAULT_INTERVAL 1` (1 s sample interval)
-   and configure the Wi-Fi/MQTT broker in `firmware/main/config.h`.
-2. Deploy the node in the location of interest.
-3. Run `server/mqtt_collector.py` to capture the full-resolution ground truth.
-4. Save the captured CSV to `dataset/raw/` with a descriptive name.
-
-When the full-resolution dataset is collected, the offline simulator can replay
-all strategies over the *exact same* sequence of real sensor readings to
-ensure a fair comparison.
-
-## Step 2: Offline replay
+## Step 0 — Verify the code before trusting any number
 
 ```bash
-. .venv/bin/activate
-python analysis/analyze.py
+python -m pytest tests/ -v
+python scripts/check_config_parity.py
 ```
 
-The `results/` directory will contain:
+Two things are being checked, and both matter for the interpretation of the
+results:
 
-- `metrics_all.csv` (per-run statistics)
-- `metrics_summary.csv` (aggregated by strategy)
-- the five figures under `results/plots/`.
+- the Python policy and the firmware policy agree sample by sample
+  (`tests/test_parity_python_c.py` compiles the on-device C sources for the host),
+- `experiments/experiment_config.yaml` and `firmware/main/config.example.h` carry
+  the same values, so "the simulator and the device run the same configuration"
+  is a fact rather than an intention.
 
-All results are reproducible because the experiment configuration lives in a
-single file (`experiments/experiment_config.yaml`) and the random seed is fixed.
+## Step 1 — Simulation
 
-## Step 3: AdaptiveSense on-device evaluation
+```bash
+python dataset/generate_dataset.py     # raw signals + independent labels
+python analysis/analyze.py             # metrics + figures into results/
+```
 
-1. Re-flash the firmware with the adaptive sampling config (the default from
-   `config.example.h` uses the same parameters as the simulator).
-2. Let the node run for the same total duration as the ground truth data.
-3. Collect the MQTT log via the collector.
+Deterministic: the generator is seeded, the label rule is absolute, and the
+analysis has no randomness. Regenerating must not change any tracked file.
+
+## Step 2 — Ground truth for a real deployment
+
+Simulation ground truth comes from the generator's own driven signal. For real
+data:
+
+1. Flash the firmware with `CONFIG_AS_MIN_INTERVAL_S`/`DEFAULT`/`MAX` all set to
+   1 s (full-resolution collection mode; the ladders must satisfy the config
+   validator, so set `CONFIG_AS_LADDER_STABLE {1,1,1}`, `_ACTIVE {1}`, `_ALERT {1}`
+   for the capture run).
+2. Put the node in the location of interest and configure Wi-Fi/MQTT in
+   `firmware/main/config.h`.
+3. Run `python server/mqtt_collector.py --host … --topic … --out dataset/raw/<name>.csv`.
+4. Convert the capture into the `timestamp,temperature,humidity,pressure,light`
+   schema.
+5. **Label it by hand** in `dataset/labels/<name>_events.csv`, using the same
+   absolute rule as the generator (`evaluation.gt_label_min_deviation` and
+   `gt_label_min_duration_s`): a labelled interval is a period during which the
+   channel was known to be materially displaced from its baseline. Record who
+   labelled it and on what evidence.
+
+Never mix synthetic and real rows in one file, and never derive labels from the
+AdaptiveSense score — that is the circularity the current design removes
+([audit_v0.2.md](audit_v0.2.md) issue #6).
+
+## Step 3 — On-device evaluation
+
+1. Flash the firmware with the experiment configuration (the defaults in
+   `config.example.h` match the simulator).
+2. Let the node run for at least the duration of the ground-truth recording.
+3. Collect the MQTT log with `server/mqtt_collector.py`.
 4. Compare:
+   - samples taken on device (count of `cycle=` log lines),
+   - packets actually delivered (`publish stats: … ok=…`),
+   - packets the policy *wanted* to send (`upload_requested=1` in the log),
+   - detection latency against the labelled ground truth,
+   - sleep behaviour (`duty cycle: …` summary every 10 cycles).
 
-   - number of samples taken by the node (on-device)
-   - number of MQTT packets transmitted
-   - event detection latency (measured as the difference between the event
-     start in the full-resolution ground truth and the first on-device
-     detection)
-   - detection rate (fraction of ground-truth events detected).
+Reporting `upload_requested` and `publish_ok` separately is required: a node whose
+broker is unreachable looks identical to an idle node if only the second number
+is reported.
 
-## Three scenarios designed for the study
+## Scenario definitions
 
-Three scenarios are pre-generated (synthetic ground truth):
+The synthetic benchmark is described in [dataset/README.md](../dataset/README.md)
+and generated by `dataset/generate_dataset.py`, which documents each segment
+in-line. The seven scenarios and what each is for:
 
-### Scenario A: Stable environment
+| id | purpose expected *a priori* |
+|----|-----------------------------|
+| A stable | large cost reduction, no events, no false positives |
+| B sudden | the step is detected; latency below the Fixed-60s baseline |
+| C mixed | the up-step is detected; the down-step may not be confirmed by the debounce |
+| D repeated | repeated detection works; expect redundant re-triggers of one physical event |
+| E short event | **expected to be missed** at a 60 s interval |
+| F noisy stable | false alarms under a mis-parameterised noise floor, for every strategy |
+| G slow drift | **expected to be missed**: slower than `baseline_tau_s` |
 
-Goal: check whether and how much sampling/communication reduction AdaptiveSense
-achieves when nothing much changes.
+Scenarios E, F and G exist to make the policy lose. They are not padding: a
+benchmark that only contains cases the policy handles cannot support a claim about
+event detection.
 
-- Expected outcome: large reduction (around 98% for a 2 h run), 0 missed events,
-  0 false positives because there are no events.
+## Reporting rules used in this repository
 
-### Scenario B: Sudden environmental change
-
-Goal: check whether AdaptiveSense detects the event with acceptable latency
-despite the low sampling rate during the preceding stable period.
-
-- Expected outcome: detects the event, latency is still much lower than the
-  coarsest fixed interval, communication reduction is similar to Fixed-20s but
-  detection rate matches Fixed-5s.
-
-### Scenario C: Mixed workload
-
-Goal: realistic workload with all phases:
-
-- stable baseline
-- small-amplitude slow oscillations
-- one large abrupt change
-- recovery
-- final slow drift
-
-Expected outcome: overall communication reduction similar to Fixed-40s–Fixed-60s
-but event detection rate matches fixed high-rate sampling (Fixed-5s/10s).
+- Numbers produced by the simulator are labelled **synthetic simulation
+  results**, never "experimental results".
+- Anything not measured on hardware is written as `Not measured yet.`
+- Detection rate for a scenario with no labelled events is **N/A**, not 0 %.
+- Overall detection rate is `sum(TP)/sum(GT)` over pooled counts, never the mean
+  of per-scenario rates.
+- No energy is reported in joules or millijoules. The reported cost quantities
+  are upload counts, estimated payload bytes and a dimensionless proxy.
 
 ## Reproducibility notes
 
-- All code is version controlled; the generator is seeded, config is explicit.
-- The synthetic datasets provided in `dataset/raw/` are reproducible by running
-  `dataset/generate_dataset.py`; the random seed is fixed at `42`.
-- Changing any parameter only requires editing `experiments/experiment_config.yaml`
-  and re-running `analysis/analyze.py`; no code changes are needed.
+- All code and data are version controlled; the generator is seeded and the
+  configuration is explicit, so `results/` is reproducible byte for byte.
+- Changing any parameter means editing `experiments/experiment_config.yaml` **and**
+  `firmware/main/config.example.h`; `scripts/check_config_parity.py` fails the
+  build if they disagree, and CI runs it.

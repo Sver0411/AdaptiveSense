@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""Check that the firmware configuration mirrors the experiment configuration.
+
+`experiments/experiment_config.yaml` is the single source of truth for every
+tunable value in this project. `firmware/main/config.example.h` mirrors it by
+hand, and `firmware/main/policy_config.c` maps those macros onto the runtime
+structs. This script fails if any of the three drift apart, so a parameter can
+never be changed in one place and silently keep its old value on the device.
+
+It additionally guards the specific structural mistakes found in v0.1:
+
+* a window size hardcoded in a C header instead of coming from `config.h`
+  (`CD_VARIETY_WINDOW_S` / `CD_ROC_WINDOW_S`),
+* numeric tuning literals inside `policy_config.c`,
+* `require(...)` calls in `CMakeLists.txt` (not an ESP-IDF build-system command).
+
+Usage::
+
+    python scripts/check_config_parity.py
+
+Exit code 0 = parity holds, 1 = at least one mismatch (also used by CI).
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple, Union
+
+import yaml
+
+ROOT = Path(__file__).resolve().parent.parent
+YAML_PATH = ROOT / "experiments" / "experiment_config.yaml"
+CONFIG_H = ROOT / "firmware" / "main" / "config.example.h"
+POLICY_CONFIG_C = ROOT / "firmware" / "main" / "policy_config.c"
+DETECTOR_H = ROOT / "firmware" / "main" / "change_detector.h"
+MAIN_CMAKE = ROOT / "firmware" / "main" / "CMakeLists.txt"
+
+# (yaml dotted path, C macro, expected kind)
+#   kind: "float"  scalar compared with a relative tolerance
+#         "bool"   yaml true/false vs C 1/0
+#         "int"    exact integer
+#         "list"   { a, b, c } compared element-wise
+SPEC: Sequence[Tuple[str, str, str]] = (
+    ("sampling.min_interval", "CONFIG_AS_MIN_INTERVAL_S", "float"),
+    ("sampling.default_interval", "CONFIG_AS_DEFAULT_INTERVAL_S", "float"),
+    ("sampling.max_interval", "CONFIG_AS_MAX_INTERVAL_S", "float"),
+
+    ("adaptive.channels.temperature.noise_floor", "CONFIG_AS_NOISE_FLOOR_TEMP", "float"),
+    ("adaptive.channels.humidity.noise_floor", "CONFIG_AS_NOISE_FLOOR_HUM", "float"),
+    ("adaptive.channels.pressure.noise_floor", "CONFIG_AS_NOISE_FLOOR_PRESS", "float"),
+    ("adaptive.channels.light.noise_floor", "CONFIG_AS_NOISE_FLOOR_LIGHT", "float"),
+    ("adaptive.channels.humidity.use", "CONFIG_AS_USE_HUMIDITY", "bool"),
+    ("adaptive.channels.pressure.use", "CONFIG_AS_USE_PRESSURE", "bool"),
+    ("adaptive.channels.light.use", "CONFIG_AS_USE_LIGHT", "bool"),
+
+    ("adaptive.analyzer.variety_window_s", "CONFIG_AS_VARIETY_WINDOW_S", "float"),
+    ("adaptive.analyzer.roc_window_s", "CONFIG_AS_ROC_WINDOW_S", "float"),
+    ("adaptive.analyzer.baseline_tau_s", "CONFIG_AS_BASELINE_TAU_S", "float"),
+
+    ("adaptive.stable_threshold", "CONFIG_AS_STABLE_THRESHOLD", "float"),
+    ("adaptive.active_threshold", "CONFIG_AS_ACTIVE_THRESHOLD", "float"),
+    ("adaptive.hysteresis_fraction", "CONFIG_AS_HYSTERESIS_FRACTION", "float"),
+
+    ("adaptive.ladders.stable", "CONFIG_AS_LADDER_STABLE", "list"),
+    ("adaptive.ladders.active", "CONFIG_AS_LADDER_ACTIVE", "list"),
+    ("adaptive.ladders.alert", "CONFIG_AS_LADDER_ALERT", "list"),
+
+    ("adaptive.ladder_confirmations.stable", "CONFIG_AS_LADDER_CONFIRM_STABLE", "int"),
+    ("adaptive.ladder_confirmations.active", "CONFIG_AS_LADDER_CONFIRM_ACTIVE", "int"),
+
+    ("adaptive.event_threshold", "CONFIG_AS_EVENT_THRESHOLD", "float"),
+    ("adaptive.event_min_duration_s", "CONFIG_AS_EVENT_MIN_DURATION_S", "float"),
+
+    ("adaptive.upload.upload_first_sample", "CONFIG_AS_UP_FIRST_SAMPLE", "bool"),
+    ("adaptive.upload.on_event", "CONFIG_AS_UP_ON_EVENT", "bool"),
+    ("adaptive.upload.on_state_change", "CONFIG_AS_UP_ON_STATE_CHANGE", "bool"),
+    ("adaptive.upload.on_interval_change", "CONFIG_AS_UP_ON_INTERVAL_CHANGE", "bool"),
+    ("adaptive.upload.heartbeat_s", "CONFIG_AS_UP_HEARTBEAT_S", "float"),
+    ("adaptive.upload.delta_threshold", "CONFIG_AS_UP_DELTA_THRESHOLD", "float"),
+)
+
+REL_TOL = 1e-6
+
+Number = Union[int, float]
+
+
+def strip_c_comments(text: str) -> str:
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+    text = re.sub(r"//[^\n]*", " ", text)
+    return text
+
+
+def parse_defines(path: Path) -> Dict[str, str]:
+    """Collect `#define NAME value` from a C header (comments removed)."""
+    text = strip_c_comments(path.read_text(encoding="utf-8"))
+    out: Dict[str, str] = {}
+    pattern = re.compile(
+        r"^\s*#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)\s+(.*?)\s*$", re.M
+    )
+    for name, value in pattern.findall(text):
+        out[name] = value.split("/*")[0].strip()
+    return out
+
+
+def parse_scalar(raw: str) -> Number:
+    cleaned = raw.strip().rstrip("fFuUlL")
+    if cleaned.lower().startswith("(bool)"):
+        cleaned = cleaned[len("(bool)"):].strip()
+    if cleaned.startswith("(") and cleaned.endswith(")"):
+        cleaned = cleaned[1:-1].strip()
+    return float(cleaned) if ("." in cleaned or "e" in cleaned.lower()) else int(cleaned)
+
+
+def parse_list(raw: str) -> List[Number]:
+    body = raw.strip()
+    if not (body.startswith("{") and body.endswith("}")):
+        raise ValueError(f"not a C array initialiser: {raw!r}")
+    items = [x.strip() for x in body[1:-1].split(",") if x.strip()]
+    return [parse_scalar(x) for x in items]
+
+
+def dig(doc: dict, dotted: str):
+    node = doc
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            raise KeyError(dotted)
+        node = node[part]
+    return node
+
+
+def compare(path: str, macro: str, kind: str, yaml_doc: dict, defines: Dict[str, str]):
+    if macro not in defines:
+        return False, f"{macro} is not defined in {CONFIG_H.name}"
+    raw = defines[macro]
+    try:
+        yaml_value = dig(yaml_doc, path)
+    except KeyError:
+        return False, f"{path} missing from {YAML_PATH.name}"
+
+    try:
+        if kind == "list":
+            c_value = parse_list(raw)
+            y_value = [parse_scalar(str(v)) for v in yaml_value]
+            if len(c_value) != len(y_value):
+                return False, f"length {len(c_value)} vs {len(y_value)}"
+            for a, b in zip(c_value, y_value):
+                if float(a) != float(b):
+                    return False, f"{c_value} != {y_value}"
+            return True, f"{c_value}"
+
+        c_value = parse_scalar(raw)
+        if kind == "bool":
+            y_bool = bool(yaml_value)
+            if bool(int(c_value)) != y_bool:
+                return False, f"{bool(int(c_value))} != {y_bool}"
+            return True, str(y_bool)
+
+        if kind == "int":
+            if int(c_value) != int(yaml_value):
+                return False, f"{int(c_value)} != {int(yaml_value)}"
+            return True, str(int(c_value))
+
+        y_num = float(yaml_value)
+        c_num = float(c_value)
+        if abs(c_num - y_num) > max(REL_TOL, REL_TOL * abs(y_num)):
+            return False, f"{c_num} != {y_num}"
+        return True, f"{c_num:g}"
+    except ValueError as exc:
+        return False, f"cannot parse {raw!r} ({exc})"
+
+
+def structural_checks() -> List[Tuple[str, bool, str]]:
+    """The v0.1 mistakes that must not come back."""
+    results: List[Tuple[str, bool, str]] = []
+
+    detector_h = strip_c_comments(DETECTOR_H.read_text(encoding="utf-8"))
+    for macro in ("CD_VARIETY_WINDOW_S", "CD_ROC_WINDOW_S"):
+        # Comments are stripped first: the header documents these macro names on
+        # purpose (as the v0.1 mistake that must not come back), so a raw text
+        # search would always report a false positive.
+        ok = macro not in detector_h
+        results.append((
+            f"{DETECTOR_H.name} does not define {macro}",
+            ok,
+            "windows must come from config.h" if not ok else "ok",
+        ))
+
+    policy_c = strip_c_comments(POLICY_CONFIG_C.read_text(encoding="utf-8"))
+    float_literals = re.findall(r"(?<![\w.])\d+\.\d+f?(?![\w.])", policy_c)
+    ok = not float_literals
+    results.append((
+        f"{POLICY_CONFIG_C.name} has no numeric literals",
+        ok,
+        f"found {float_literals}" if not ok else "ok",
+    ))
+
+    cmake = MAIN_CMAKE.read_text(encoding="utf-8")
+    bad = re.findall(r"^\s*require\s*\(", cmake, flags=re.M)
+    ok = not bad
+    results.append((
+        f"{MAIN_CMAKE.name} does not call require()",
+        ok,
+        "require() is not an ESP-IDF command; use REQUIRES" if not ok else "ok",
+    ))
+
+    has_requires = "REQUIRES" in cmake
+    results.append((
+        f"{MAIN_CMAKE.name} declares dependencies with REQUIRES",
+        has_requires,
+        "ok" if has_requires else "no REQUIRES clause found",
+    ))
+
+    manifest = (MAIN_CMAKE.parent / "idf_component.yml")
+    if manifest.exists():
+        text = manifest.read_text(encoding="utf-8")
+        # A managed `mqtt` component would be a second dependency mechanism.
+        managed_mqtt = re.search(r"^\s{2}mqtt\s*:", text, flags=re.M) is not None
+        results.append((
+            "idf_component.yml does not declare a managed mqtt component",
+            not managed_mqtt,
+            "two mechanisms for one component" if managed_mqtt else "ok",
+        ))
+
+    sleep_ok = "esp_wifi_stop" not in (
+        ROOT / "firmware" / "main" / "power_mgmt.c"
+    ).read_text(encoding="utf-8")
+    results.append((
+        "power_mgmt.c does not stop Wi-Fi before sleeping",
+        sleep_ok,
+        "the radio must survive the sleep" if not sleep_ok else "ok",
+    ))
+
+    return results
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--quiet", action="store_true", help="only print failures")
+    args = parser.parse_args()
+
+    with open(YAML_PATH, "r", encoding="utf-8") as fh:
+        yaml_doc = yaml.safe_load(fh)
+    defines = parse_defines(CONFIG_H)
+
+    failures = 0
+    print(f"config parity: {YAML_PATH.relative_to(ROOT)}  <->  "
+          f"{CONFIG_H.relative_to(ROOT)}")
+    print(f"{'parameter':52s} {'firmware':>18s}  result")
+    print("-" * 86)
+
+    for path, macro, kind in SPEC:
+        ok, detail = compare(path, macro, kind, yaml_doc, defines)
+        if not ok:
+            failures += 1
+        if not ok or not args.quiet:
+            print(f"{path:52s} {detail:>18s}  {'OK' if ok else 'MISMATCH'}")
+
+    print()
+    print("structural checks")
+    print(f"{'check':62s} result")
+    print("-" * 86)
+    for name, ok, detail in structural_checks():
+        if not ok:
+            failures += 1
+        if not ok or not args.quiet:
+            print(f"{name:62s} {'OK' if ok else 'FAIL: ' + detail}")
+
+    print()
+    if failures:
+        print(f"FAIL: {failures} item(s) failed config parity")
+        return 1
+    total = len(SPEC) + len(structural_checks())
+    print(f"PASS: all {total} checks passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
