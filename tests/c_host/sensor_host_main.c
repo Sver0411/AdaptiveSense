@@ -95,11 +95,16 @@ static int cmd_supervisor(int argc, char **argv)
     /* First attempt, which fails. */
     sensor_sup_note_attempt(&sup, 0.0, false);
 
-    char *times = strdup(argv[3]);
+    /* strtok() mutates its input, so work on a copy. Built with malloc + memcpy
+     * rather than strdup: strdup is POSIX, not ISO C, and glibc hides it under
+     * -std=c11, which is what the host tests compile with. Found by CI. */
+    const size_t times_len = strlen(argv[3]) + 1;
+    char *times = malloc(times_len);
     if (times == NULL) {
         fprintf(stderr, "allocation failed\n");
         return 2;
     }
+    memcpy(times, argv[3], times_len);
     for (char *tok = strtok(times, ","); tok != NULL; tok = strtok(NULL, ",")) {
         const double t = strtod(tok, NULL);
         const int should = (int)sensor_sup_should_attempt(&sup, t);
