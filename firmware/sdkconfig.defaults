@@ -1,0 +1,23 @@
+# AdaptiveSense ESP32-S3 default sdkconfig (kept minimal and public).
+CONFIG_IDF_TARGET="esp32s3"
+
+# --- Core options ---
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# --- PSRAM (N16R8 has 8 MB octal) ---
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# --- FreeRTOS ---
+CONFIG_FREERTOS_HZ=1000
+
+# Free up memory: we only need the MQTT + sensor stack.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+
+# --- Logging ---
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# --- Components required by the application ---
+CONFIG_MQTT_PROTOCOL_311=y
