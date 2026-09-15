@@ -1,0 +1,13 @@
+# Python dependencies for the AdaptiveSense simulator, analysis and tests.
+# The analysis environment runs on macOS / Linux (verified with Python 3.14).
+#   python3 -m venv .venv
+#   ./.venv/bin/pip install -r requirements.txt
+#
+# Optional: MQTT data collector (server/) uses paho-mqtt:
+#   ./.venv/bin/pip install -r requirements-server.txt
+
+numpy>=1.26
+pandas>=2.0
+matplotlib>=3.7
+PyYAML>=6.0
+pytest>=8.0

@@ -1,0 +1,46 @@
+# ==========================================================================
+# AdaptiveSense .gitignore
+# ==========================================================================
+
+# --- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# --- macOS -----------------------------------------------------------------
+.DS_Store
+
+# --- Secrets / credentials: NEVER commit real ones --------------------------
+# Firmware local configuration holds Wi-Fi passwords and MQTT credentials.
+# Only config.example.h is tracked (safe placeholders).
+firmware/main/config.h
+firmware/sdkconfig
+firmware/build/
+firmware/managed_components/
+firmware/.build/
+firmware/dependencies.lock
+
+# Generic secret files
+*.pem
+*.key
+*.secret
+.env
+credentials*
+
+# --- ESP-IDF --------------------------------------------------------------
+firmware/partition_table/*.bin
+
+# --- Live / transient results ------------------------------------------------
+# Committed results are the reproducible simulation outputs under results/.
+# Live captures from a running node are transient and should not be tracked.
+results/live/
+
+# --- Editors ----------------------------------------------------------------
+*.swp
+*.swo
+.idea/
+.vscode/

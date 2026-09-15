@@ -1,0 +1,2 @@
+# Optional runtime dependency for server/mqtt_collector.py only.
+paho-mqtt>=2.1
