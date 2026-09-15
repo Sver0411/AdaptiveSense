@@ -53,7 +53,7 @@ def test_figures_embed_no_library_version(tmp_path, monkeypatch):
 
     df = pd.read_csv(METRICS_ALL)
     plots.plot_sampling_count(df)
-    plots.plot_communication_reduction(df)
+    plots.plot_application_upload_reduction(df)
     plots.plot_event_detection(df)
     plots.plot_detection_latency(df)
     plots.plot_tradeoff(pd.read_csv(METRICS_SUMMARY))
@@ -79,7 +79,7 @@ def test_committed_figures_are_present_and_non_trivial():
     plots_dir = ROOT / "results" / "plots"
     expected = {
         "sampling_count.png",
-        "communication_reduction.png",
+        "application_upload_reduction.png",
         "event_detection.png",
         "detection_latency.png",
         "accuracy_efficiency_tradeoff.png",

@@ -117,7 +117,7 @@ def main() -> None:
     eval_cfg = cfg["evaluation"]
     tolerance = float(eval_cfg["event_match_tolerance_s"])
     payload_bytes = float(cfg["adaptive"]["energy"]["payload_bytes_per_upload"])
-    energy_units = float(cfg["adaptive"]["energy"]["communication_energy_units_per_upload"])
+    energy_units = float(cfg["adaptive"]["energy"]["upload_energy_units_per_upload"])
 
     runs_by_strategy: "OrderedDict[str, List[RunMetrics]]" = OrderedDict()
     all_rows: List[Dict[str, object]] = []

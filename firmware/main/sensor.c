@@ -6,35 +6,51 @@
  * calibration parsing and compensation maths live in `bme280_math.c`, which has
  * no ESP-IDF dependency and is unit-tested on the host.
  *
- * Measurement model — FORCED MODE (see docs/hardware.md and the README):
+ * Measurement model — FORCED MODE (see docs/hardware.md):
  *
  *   wake -> trigger one BME280 conversion -> wait for it (bounded) -> read ->
  *   evaluate -> sleep
  *
  * The sensor is never left converting while the MCU sleeps, and it is never in
- * normal mode continuously sampling in the background. `ctrl_meas` bits [1:0]
- * are therefore always written with 0b01 (forced). v0.1 wrote 0b01 while its
- * comment claimed normal mode, and never re-triggered a conversion, so every
- * read after the first returned stale registers.
+ * normal mode continuously sampling in the background. `ctrl_meas` bits [1:0] are
+ * therefore always written with 0b01 (forced).
+ *
+ * Initialisation contract
+ * -----------------------
+ * `sensor_read()` refuses to do anything until `sensor_init()` has reported
+ * success, so a detached sensor can never produce a reading of zeros that the
+ * change detector would treat as a real measurement. The decision of when to
+ * retry init lives in `sensor_supervisor.c` (pure C, host-tested); this file only
+ * enforces the contract and owns the hardware state.
  *
  * Uses the current ESP-IDF I2C master driver (`driver/i2c_master.h`); the legacy
  * `driver/i2c.h` API is deprecated from ESP-IDF v5.2 onwards.
+ *
+ * Host build: with CONFIG_AS_USE_MOCK_SENSOR=1 the I2C paths are compiled out
+ * entirely, so the file builds against the test-only `esp_log.h` shim in
+ * tests/c_host/shims and its public contract can be tested on a workstation.
+ * See tests/test_sensor_contract.py.
  */
 #include <math.h>
 #include <string.h>
 
-#include "esp_err.h"
 #include "esp_log.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-
-#include "driver/i2c_master.h"
 
 #include "bme280_math.h"
-#include "config.h"
+#include "config_include.h"
 #include "sensor.h"
 
+#if !CONFIG_AS_USE_MOCK_SENSOR
+#include "esp_err.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/i2c_master.h"
+#endif
+
 static const char *TAG = "sensor";
+
+/* Set to true only by a sensor_init() that actually succeeded. */
+static bool s_sensor_initialized = false;
 
 /* ------------------------------------------------------------------ */
 /* Mock sensor: reproducible synthetic sequence (documented in README). */
@@ -56,6 +72,7 @@ static void mock_fill(sensor_read_t *out)
 }
 #endif /* CONFIG_AS_USE_MOCK_SENSOR */
 
+#if !CONFIG_AS_USE_MOCK_SENSOR
 /* ------------------------------------------------------------------ */
 /* BME280 registers                                                    */
 /* ------------------------------------------------------------------ */
@@ -86,7 +103,6 @@ static void mock_fill(sensor_read_t *out)
  * spi3w_en[0]=0. Written once to clear the reset defaults. */
 #define BME280_CONFIG_VALUE 0x00u
 
-#if !CONFIG_AS_USE_MOCK_SENSOR
 static i2c_master_bus_handle_t s_bus = NULL;
 static i2c_master_dev_handle_t s_dev = NULL;
 static bme280_calib_t s_cal;
@@ -132,22 +148,21 @@ static esp_err_t bme_trigger_measurement(void)
 /*
  * Wait until the chip clears the `measuring` bit, with a hard timeout.
  *
- * At oversampling x1/x1/x1 the datasheet's worst-case conversion time
- * (t_measure,max) is well under 20 ms; CONFIG_AS_BME280_MEAS_TIMEOUT_MS is the
- * upper bound and the function never blocks longer than that. The initial short
- * delay makes sure we do not sample a status register that has not yet been
- * updated to `measuring = 1`.
+ * At oversampling x1/x1/x1 the datasheet's worst-case conversion time is well
+ * under 20 ms; CONFIG_AS_BME280_MEAS_TIMEOUT_MS is the upper bound and the
+ * function never blocks longer than that. The initial short delay makes sure we
+ * do not sample a status register that has not yet been updated.
  */
 static esp_err_t bme_wait_measurement(void)
 {
     vTaskDelay(pdMS_TO_TICKS(CONFIG_AS_BME280_MEAS_SETTLE_MS));
 
-    const int64_t deadline_us =
+    const int64_t remaining_us =
         (int64_t)CONFIG_AS_BME280_MEAS_TIMEOUT_MS * 1000 -
         (int64_t)CONFIG_AS_BME280_MEAS_SETTLE_MS * 1000;
     int64_t waited_us = 0;
 
-    while (waited_us < deadline_us) {
+    while (waited_us < remaining_us) {
         uint8_t status = 0;
         esp_err_t err = bme_read_u8(BME280_REG_STATUS, &status);
         if (err != ESP_OK) {
@@ -160,8 +175,8 @@ static esp_err_t bme_wait_measurement(void)
         waited_us += 1000;
     }
 
-    /* Bounded failure, never an infinite wait: report it and let the caller
-     * decide (the sample is marked invalid rather than silently reused). */
+    /* Bounded failure, never an infinite wait: the caller marks the sample
+     * invalid rather than reusing a stale register. */
     return ESP_ERR_TIMEOUT;
 }
 #endif /* !CONFIG_AS_USE_MOCK_SENSOR */
@@ -173,6 +188,7 @@ int sensor_init(void)
 {
 #if CONFIG_AS_USE_MOCK_SENSOR
     ESP_LOGW(TAG, "MOCK sensor enabled - results are NOT real measurements");
+    s_sensor_initialized = true;
     return 0;
 #else
     const i2c_master_bus_config_t bus_config = {
@@ -254,6 +270,7 @@ int sensor_init(void)
         return -1;
     }
 
+    s_sensor_initialized = true;
     ESP_LOGI(TAG, "BME280 ready at 0x%02x (forced measurement mode, timeout %d ms)",
              (unsigned)CONFIG_AS_BME280_I2C_ADDR,
              (int)CONFIG_AS_BME280_MEAS_TIMEOUT_MS);
@@ -264,6 +281,12 @@ int sensor_init(void)
 int sensor_read(sensor_read_t *out)
 {
     if (out == NULL) {
+        return -1;
+    }
+    /* Contract: nothing is read before a successful init. Returning here leaves
+     * `out` untouched, so a caller that ignores the return value cannot mistake
+     * zeros for a measurement. */
+    if (!s_sensor_initialized) {
         return -1;
     }
     memset(out, 0, sizeof(*out));
@@ -295,9 +318,12 @@ int sensor_read(sensor_read_t *out)
     bme280_parse_raw(data, &raw);
 
     int32_t t_fine = 0;
-    const double temperature = bme280_compensate_temperature(&s_cal, raw.temperature, &t_fine);
-    const double pressure_pa = bme280_compensate_pressure(&s_cal, raw.pressure, t_fine);
-    const double humidity = bme280_compensate_humidity(&s_cal, raw.humidity, t_fine);
+    const double temperature =
+        bme280_compensate_temperature(&s_cal, raw.temperature, &t_fine);
+    const double pressure_pa =
+        bme280_compensate_pressure(&s_cal, raw.pressure, t_fine);
+    const double humidity =
+        bme280_compensate_humidity(&s_cal, raw.humidity, t_fine);
 
     out->value[SEN_CH_TEMPERATURE] = (float)temperature;
     out->value[SEN_CH_HUMIDITY] = (float)humidity;
@@ -307,13 +333,18 @@ int sensor_read(sensor_read_t *out)
     out->valid[SEN_CH_HUMIDITY] = true;
     out->valid[SEN_CH_PRESSURE] = true;
 
-    /* The light channel needs a separate BH1750, which is NOT implemented in
-     * this version. The channel is reported invalid so the change detector
-     * excludes it, and the README says so explicitly. */
+    /* The light channel needs a separate BH1750, which this build does NOT
+     * implement. The channel is reported invalid so the change detector excludes
+     * it, and the MQTT payload sends `null` rather than a plausible 0. */
     out->value[SEN_CH_LIGHT] = 0.0f;
     out->valid[SEN_CH_LIGHT] = false;
     return 0;
 #endif /* CONFIG_AS_USE_MOCK_SENSOR */
+}
+
+bool sensor_is_initialized(void)
+{
+    return s_sensor_initialized;
 }
 
 const char *sensor_channel_name(sen_channel_t c)

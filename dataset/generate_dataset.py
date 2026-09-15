@@ -24,9 +24,23 @@ Scenarios
 | B sudden        | 30 min | one abrupt +5 degC step          | step detection + latency |
 | C mixed         | 2 h    | sub-threshold wobble, step up, step down | realistic mixed workload |
 | D repeated      | 1 h    | 6 irregular steps + 2 light bursts | repeated detection, second modality |
-| E short         | 30 min | one 14 s spike after a long quiet period | a short event missed by a long interval |
+| E short         | 30 min | one 26 s spike after a long quiet period | a short event missed by a long interval |
 | F noisy stable  | 20 min | nothing, noise ~7x the configured floor | false positives under a mis-parameterised floor |
 | G slow drift    | 1 h    | +3 degC over 30 min, hold, return | behaviour on slow (non-abrupt) change |
+
+Label counts
+------------
+One injected physical disturbance can move more than one channel: the generator
+couples humidity to temperature, so most temperature disturbances also produce a
+humidity disturbance. The benchmark is therefore described in two units, and the
+program prints both:
+
+  * **physical disturbances** — maximal intervals in which the generator drives
+    *any* channel beyond its labelling threshold (`count_disturbances`)
+  * **channel-level labels** — one per (channel, interval) pair, which is what the
+    evaluation matches against (`label_events`)
+
+Do not quote one number as the other.
 
 Usage::
 
@@ -216,6 +230,47 @@ def label_events(driven: Dict[str, List[float]], cfg: dict) -> List[Event]:
             )
     events.sort(key=lambda e: (e.start_s, e.channel))
     return events
+
+
+def count_disturbances(driven: Dict[str, List[float]], cfg: dict) -> int:
+    """Number of injected *physical* disturbances, not channel labels.
+
+    A disturbance is a maximal interval during which the generator drives **any**
+    channel beyond that channel's labelling threshold; channels that move together
+    (temperature and its coupled humidity) count as one disturbance. The same
+    minimum-duration filter as `label_events` is applied, so a blip that produces
+    no label also produces no disturbance.
+
+    This is the smaller of the two units the benchmark can be described in, and it
+    is the one that describes what was physically injected. See the module
+    docstring.
+    """
+    ev = cfg["evaluation"]
+    min_dur = float(ev["gt_label_min_duration_s"])
+    thresholds = {k: float(v) for k, v in ev["gt_label_min_deviation"].items()}
+
+    length = len(next(iter(driven.values()))) if driven else 0
+    above = [False] * length
+    for channel, threshold in thresholds.items():
+        series = driven.get(channel)
+        if not series:
+            continue
+        for i, value in enumerate(series):
+            if abs(value) >= threshold:
+                above[i] = True
+
+    count = 0
+    i = 0
+    while i < length:
+        if not above[i]:
+            i += 1
+            continue
+        start = i
+        while i < length and above[i]:
+            i += 1
+        if float(i - 1 - start) >= min_dur:
+            count += 1
+    return count
 
 
 # ---------------------------------------------------------------------- #
@@ -413,23 +468,34 @@ def main() -> None:
     RAW.mkdir(parents=True, exist_ok=True)
     LABELS.mkdir(parents=True, exist_ok=True)
 
-    total_events = 0
+    total_labels = 0
+    total_disturbances = 0
     print(f"evaluation.gt_label_min_deviation = {cfg['evaluation']['gt_label_min_deviation']}")
     print(f"evaluation.gt_label_min_duration_s = {cfg['evaluation']['gt_label_min_duration_s']}")
     print()
+    print(f"{'scenario':26s} {'rows':>6s} {'disturb':>8s} {'labels':>7s}  channels")
     for factory in SCENARIOS:
         spec = factory()
         rows, driven = build(spec)
         events = label_events(driven, cfg)
+        disturbances = count_disturbances(driven, cfg)
         write_csv(RAW / f"{spec.name}.csv", rows)
         write_labels(LABELS / f"{spec.name}_events.csv", events)
-        total_events += len(events)
-        types = ", ".join(f"{e.channel}:{e.event_type}" for e in events) or "-"
-        print(f"{spec.name:26s} {len(rows):6d} rows  {len(events):2d} events  [{types}]")
+        total_labels += len(events)
+        total_disturbances += disturbances
+        channels = ", ".join(sorted({e.channel for e in events})) or "-"
+        print(f"{spec.name:26s} {len(rows):6d} {disturbances:8d} {len(events):7d}  {channels}")
         print(f"{'':26s} {spec.description}")
     print()
     print(f"wrote {len(SCENARIOS)} scenarios to {RAW}")
-    print(f"wrote {total_events} ground-truth events to {LABELS}")
+    print(
+        f"wrote {total_labels} channel-level labels to {LABELS}, derived from "
+        f"{total_disturbances} injected physical disturbances"
+    )
+    print(
+        "  (one injected disturbance can label several channels: humidity is "
+        "coupled to temperature)"
+    )
 
 
 if __name__ == "__main__":

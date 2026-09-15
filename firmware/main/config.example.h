@@ -39,15 +39,38 @@
 #define CONFIG_AS_MQTT_PASS       ""          /* leave empty if none    */
 #define CONFIG_AS_MQTT_TOPIC      "adaptivesense/data"
 #define CONFIG_AS_MQTT_QOS        0
-#define CONFIG_AS_MQTT_KEEPALIVE_S 30         /* must exceed the sleep time or
-                                                 the broker drops the session */
+
+/*
+ * Keepalive.
+ *
+ * The published keepalive is what bounds how long the broker will wait for any
+ * traffic before declaring the session dead. It must comfortably exceed the
+ * longest idle window, or the node can be asleep when the broker decides the
+ * session is gone — hence the static constraint below: keepalive >= 2 x the
+ * maximum sampling interval.
+ *
+ * Note what this does NOT mean. Keepalive is itself traffic: the MQTT client
+ * task sends PINGREQ and the broker replies PINGRESP, and in this architecture
+ * that activity wakes the chip out of light sleep through the Wi-Fi driver's
+ * PM locks. The value therefore trades session robustness against wake-ups, and
+ * it is one of the reasons the reported `application_upload_reduction` is a
+ * payload metric and not a total radio-traffic metric. See the README.
+ */
+#define CONFIG_AS_MQTT_KEEPALIVE_S 120  /* >= 2 x CONFIG_AS_MAX_INTERVAL_S */
 
 /* ------------------------------------------------------------------ */
 /* Sensor (BME280 over I2C) / mock                                     */
-/* CONFIG_AS_USE_MOCK_SENSOR forces a deterministic fake sensor that    */
-/* mirrors dataset/ so the firmware logic can be exercised without HW.  */
 /* ------------------------------------------------------------------ */
+/*
+ * CONFIG_AS_USE_MOCK_SENSOR forces a deterministic fake sensor that mirrors
+ * dataset/ so the firmware logic can be exercised without hardware. It is
+ * guarded so a host-side test can override it on the compiler command line
+ * (-DCONFIG_AS_USE_MOCK_SENSOR=1) and exercise the driver's public contract
+ * without an ESP32 attached.
+ */
+#ifndef CONFIG_AS_USE_MOCK_SENSOR
 #define CONFIG_AS_USE_MOCK_SENSOR     0
+#endif
 #define CONFIG_AS_SENSOR_SDA_GPIO     4
 #define CONFIG_AS_SENSOR_SCL_GPIO     5
 #define CONFIG_AS_I2C_FREQ_HZ         400000
@@ -97,8 +120,8 @@
  *   ACTIVE descends (sample faster while the environment is moving)
  *   ALERT  is fixed at the minimum interval
  *
- * v0.1 had `{ 60, 30, 15, 5 }` for ACTIVE, so the node waited 60 s immediately
- * after detecting change. Do not restore that ordering:
+ * An earlier revision had `{ 60, 30, 15, 5 }` for ACTIVE, so the node waited
+ * 60 s immediately after detecting change. Do not restore that ordering:
  * scripts/check_config_parity.py checks the ladder values, and
  * simulator/config.py rejects a ladder that is not monotone in the right
  * direction.
@@ -127,30 +150,41 @@
 /* ------------------------------------------------------------------ */
 /* Power management                                                    */
 /* ------------------------------------------------------------------ */
-/* 0 = none   : FreeRTOS vTaskDelay; radio stays up. Use for bench work.
- * 1 = light  : esp_light_sleep_start(); RAM + Wi-Fi association retained.
- *              DEFAULT.
- * 2 = deep   : esp_deep_sleep_start(). Rejected below: deep sleep reboots the
- *              chip, so the change-detector EMA baselines, the ladder position
- *              and the event debounce state would all be lost. Persisting them
- *              in RTC memory is out of scope for v0.2 (see README limitations).
+/*
+ * 0 = none        : vTaskDelay only; the radio and CPU stay on. Bench/debug use.
+ * 1 = auto light  : vTaskDelay, and the ESP-IDF power manager enters light sleep
+ *                   automatically while the scheduler is idle (FreeRTOS tickless
+ *                   idle + Wi-Fi modem sleep). DEFAULT.
+ * 2 = deep        : ESP deep sleep. Rejected below: it reboots the chip, so the
+ *                   detector's EMA baselines, the ladder position and the event
+ *                   debounce state would not survive. Experimental, not enabled.
  *
- * v0.1 had a boolean CONFIG_AS_DEEP_SLEEP_ENABLE guarding a *light* sleep call,
- * so the name did not describe the behaviour.
+ * The application never calls esp_light_sleep_start() — see
+ * docs/power_management.md.
  */
 #define CONFIG_AS_SLEEP_MODE 1
 
-/* Wi-Fi modem-sleep power save is enabled once at start-up by
- * communication_start() (WIFI_PS_MIN_MODEM). The radio is never stopped
- * between samples, so the MQTT session survives the light sleeps. */
+/* Wi-Fi modem sleep (WIFI_PS_MIN_MODEM) is enabled once at start-up by
+ * communication_start(). It is a radio power-save mode, NOT an energy
+ * measurement: the node's energy is "Not measured yet." until a current monitor
+ * is attached. The station is never stopped between samples. */
 #define CONFIG_AS_WIFI_MODEM_SLEEP_ENABLE 1
 
 #if CONFIG_AS_SLEEP_MODE == 2
-#error "CONFIG_AS_SLEEP_MODE=2 (deep sleep) is experimental in v0.2: the adaptive scheduler state is not persisted across the reboot. Use 0 (none) or 1 (light sleep)."
+#error "CONFIG_AS_SLEEP_MODE=2 (deep sleep) is experimental: the adaptive scheduler state is not persisted across the reboot. Use 0 (none) or 1 (auto light sleep)."
 #endif
 
-#if CONFIG_AS_SLEEP_MODE != 0 && CONFIG_AS_SLEEP_MODE != 1 && CONFIG_AS_SLEEP_MODE != 2
-#error "CONFIG_AS_SLEEP_MODE must be 0 (none), 1 (light) or 2 (deep)"
+#if CONFIG_AS_SLEEP_MODE != 0 && CONFIG_AS_SLEEP_MODE != 1
+#error "CONFIG_AS_SLEEP_MODE must be 0 (none) or 1 (auto light sleep); 2 is rejected above"
+#endif
+
+/* ------------------------------------------------------------------ */
+/* Cross-checks                                                        */
+/* ------------------------------------------------------------------ */
+/* The MQTT keepalive must outlast the longest idle window by a margin, so a
+ * sleeping node is never declared gone by the broker. */
+#if CONFIG_AS_MQTT_KEEPALIVE_S < (2 * CONFIG_AS_MAX_INTERVAL_S)
+#error "CONFIG_AS_MQTT_KEEPALIVE_S must be at least twice CONFIG_AS_MAX_INTERVAL_S"
 #endif
 
 #endif /* ADAPTIVESENSE_CONFIG_H */

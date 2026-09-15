@@ -71,8 +71,8 @@ is visible.
 
 ## The seven scenarios
 
-| file | duration | rows | labelled events | injected content |
-|------|----------|-----:|----------------:|------------------|
+| file | duration | rows | labelled | injected content |
+|------|----------|-----:|---------:|------------------|
 | `scenario_a_stable.csv` | 2 h | 7200 | 0 | nothing (only a 0.002 °C/slow sinusoidal drift) |
 | `scenario_b_sudden.csv` | 30 min | 1800 | 2 | one abrupt +5 °C step at t = 632 s, held to 1210 s, recovered by 1500 s |
 | `scenario_c_mixed.csv` | 2 h | 7200 | 4 | ±0.9 °C wobble (sub-threshold), +4.5 °C step at 3300 s, −2.5 °C step at 5940 s |
@@ -81,12 +81,27 @@ is visible.
 | `scenario_f_noisy_stable.csv` | 20 min | 1200 | 0 | nothing, but noise ≈ 7× the configured temperature noise floor |
 | `scenario_g_slow_drift.csv` | 1 h | 3600 | 2 | +3 °C over 30 min, hold, return |
 
-24 labelled events in total, over 26 400 s of signal.
-
 Scenarios E, F and G are the ones the policy is expected to do badly on: a short
 event that can fall between two samples, a mis-parameterised noise floor that
 provokes false alarms, and a drift slower than the EMA baseline. They are there so
 the benchmark can show failure — see the README's *Limitations*.
+
+## Two units: 13 disturbances, 24 labels
+
+The benchmark is described in two different units, and they are not
+interchangeable:
+
+| unit | count | what it is |
+|------|------:|------------|
+| **injected physical disturbances** | **13** | a maximal interval during which the generator drives *any* channel beyond its labelling threshold |
+| **channel-level labels** | **24** | one per `(channel, interval)` pair — what the evaluation matches against |
+
+Humidity is coupled to temperature by the generator, so most disturbances produce
+two labels. Per-scenario: A 0/0, B 1/2, C 2/4, D 8/14, E 1/2, F 0/0, G 1/2.
+
+Both counts are printed by `python dataset/generate_dataset.py` and asserted in
+`tests/test_events.py::test_channel_labels_come_from_fewer_physical_disturbances`,
+so neither can drift silently. Do not quote one as the other.
 
 ## Regenerating
 

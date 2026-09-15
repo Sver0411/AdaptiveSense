@@ -134,6 +134,20 @@ def _validate(cfg: dict) -> None:
         if float(dev) <= 0:
             raise ValueError(f"evaluation.gt_label_min_deviation.{name} must be positive")
 
+    # --- firmware-only parameters ----------------------------------------
+    # They do not affect the simulation, but they are still validated here so a
+    # broken value cannot reach the device through the parity-checked mirror.
+    fw = cfg.get("firmware", {})
+    keepalive = float(fw.get("mqtt_keepalive_s", 0.0))
+    if keepalive <= 0.0:
+        raise ValueError("firmware.mqtt_keepalive_s must be positive")
+    if keepalive < 2.0 * hi:
+        raise ValueError(
+            f"firmware.mqtt_keepalive_s ({keepalive:g}) must be at least twice "
+            f"sampling.max_interval ({hi:g}); a sleeping node would otherwise be "
+            f"declared gone by the broker"
+        )
+
 
 def ladder(cfg: dict, state: str) -> List[float]:
     return [float(x) for x in cfg["adaptive"]["ladders"][state.lower()]]

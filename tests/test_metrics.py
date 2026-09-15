@@ -66,7 +66,7 @@ def test_reduction_fractions():
             uploads=120, duration_s=3590.0)
     assert m.number_of_samples == 360
     assert m.sampling_reduction == pytest.approx(1 - 360 / 3600)
-    assert m.communication_reduction == pytest.approx(1 - 120 / 3600)
+    assert m.application_upload_reduction == pytest.approx(1 - 120 / 3600)
     assert m.estimated_payload_bytes == 120 * 96
 
 
@@ -162,8 +162,8 @@ def test_average_interval_is_none_for_a_single_sample():
 def test_no_physical_energy_unit_is_reported():
     m = run(uploads=25)
     row = m.csv_row()
-    assert "communication_energy_proxy" in row
-    assert row["communication_energy_proxy"] == 25.0
+    assert "upload_energy_proxy" in row
+    assert row["upload_energy_proxy"] == 25.0
     assert not any("mj" in key.lower() for key in row)
     assert not any("joule" in key.lower() for key in row)
 

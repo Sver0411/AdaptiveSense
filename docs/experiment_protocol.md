@@ -71,12 +71,14 @@ AdaptiveSense score — that is the circularity the current design removes
 3. Collect the MQTT log with `server/mqtt_collector.py`.
 4. Compare:
    - samples taken on device (count of `cycle=` log lines),
-   - packets actually delivered (`publish stats: … ok=…`),
+   - publish calls the MQTT client accepted (`publish stats: … call_ok=…`),
    - packets the policy *wanted* to send (`upload_requested=1` in the log),
+   - the gap between those two counters (a dead broker shows up as `call_failed`),
+   - observed light-sleep entries versus idle requests (`duty cycle: … light_sleep_entries=…`),
    - detection latency against the labelled ground truth,
    - sleep behaviour (`duty cycle: …` summary every 10 cycles).
 
-Reporting `upload_requested` and `publish_ok` separately is required: a node whose
+Reporting `upload_requested` and `call_ok` separately is required: a node whose
 broker is unreachable looks identical to an idle node if only the second number
 is reported.
 

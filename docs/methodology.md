@@ -66,54 +66,133 @@ when the scenario contains no labelled event. Overall numbers are micro
 aggregates: `sum(TP)/sum(GT)`, pooled counts, and latency recomputed over the
 pooled matched-pair list.
 
+### What the detection numbers measure — and what they do not
+
+There are two different things in this project that are both called "an event",
+and the results table only ever reports the second one:
+
+| | Online event | Evaluation event |
+|---|---|---|
+| where | firmware / live scheduler | offline, `simulator/events.py` |
+| input | one global score, max over all channels | each channel's own sampled stream |
+| output | a single `event_active` boolean | one `(channel, start_s, end_s)` interval per channel |
+| used for | scheduling, the upload decision, the device log | detection rate and latency versus the labels |
+
+Consequently:
+
+- The detection rate is a **sampling-quality** metric: how much of the
+  environmental event structure survives in the samples a strategy chose to take.
+- It is **not** an accuracy measurement of the firmware's `event_active` flag, and
+  the two can legitimately disagree — a humidity-only disturbance raises the
+  online flag exactly as a temperature disturbance does, while the offline
+  detector attributes it to the humidity channel.
+
+This is deliberate: the research question is about *adaptive sampling*, not about
+classifier accuracy, and scoring every strategy with one shared offline detector
+means a difference between strategies comes from the sampling and not from the
+extraction.
+
+### Two units: disturbances and labels
+
+The benchmark contains **24 channel-level labels derived from 13 injected physical
+disturbances**. A single physical disturbance may create labels on more than one
+channel, because the generator couples humidity to temperature. Both counts are
+printed by `dataset/generate_dataset.py` and asserted in `tests/test_events.py`, so
+neither can drift silently. Do not quote one as the other.
+
 ## Cost accounting
 
 | column | meaning |
 |--------|---------|
 | `number_of_samples` | readings the node would take |
 | `number_of_uploads` | packets the policy requested |
-| `estimated_payload_bytes` | uploads × configured payload size |
-| `communication_energy_proxy` | uploads × a configured dimensionless constant |
+| `estimated_payload_bytes` | uploads × the measured size of one payload |
+| `upload_energy_proxy` | uploads × a configured dimensionless constant |
 
-No physical energy unit is reported. `communication_energy_proxy` is an invented
-constant and is only meaningful for comparing strategies within one run.
+`payload_bytes_per_upload` is a measurement, not a guess: 246 bytes is what the
+firmware's own payload builder produces for the shipped build, and
+`tests/test_communication_payload.py` re-measures it. The true length varies with
+the number of digits in the readings, so the constant is representative rather than
+exact.
 
-## `upload_requested` is not `publish_success`
+No physical energy unit is reported.
+
+### `application upload reduction` is not a radio-traffic metric
+
+The reduction metric is
+
+```
+1 − number_of_application_uploads / number_of_ground_truth_samples
+```
+
+and it excludes everything the radio does on its own: Wi-Fi beacon reception, TCP
+ACKs, MQTT keepalive PINGREQ/PINGRESP, MQTT protocol overhead, reassociation and
+DHCP traffic. A node whose uploads drop by 97 % has **not** reduced total radio
+traffic by 97 %; the keepalive alone guarantees background traffic, and in this
+architecture that traffic can wake the chip out of light sleep.
+
+The name is therefore `application_upload_reduction`, not "communication
+reduction", and the same qualification applies to `upload_energy_proxy`.
+
+## `upload_requested` is not `publish_call_ok`
 
 The policy decides whether a sample *should* be transmitted
-(`upload_requested`). The transport layer decides whether it *was*
-(`publish_success`). On device these are logged and counted separately:
+(`upload_requested`). The transport layer reports whether the MQTT client accepted
+the request (`publish_call_ok`). On device these are logged and counted separately:
 
 ```
 cycle=12 t=220.0 state=1 interval=15.0s score=6.71 event=0 \
-upload_requested=1 publish_success=1 temp=25.02 hum=44.88
+upload_requested=1 publish_call_ok=1 temp=25.02 hum=44.88
 ```
 
 ```
-I (…) comm: publish stats: requested=152 ok=148 failed=4 mqtt_connected=1
+I (…) comm: publish stats: requested=152 call_ok=148 call_failed=4 mqtt_connected=1
 ```
 
-The scheduler's upload baseline follows the *decision*, not the transport
-outcome, so that the offline simulator and the device run the same policy; this
-is what the Python/C parity test checks. A non-zero `publish_failed` with the
-counters visible in the log is what makes a dead broker diagnosable — in v0.1 a
-disconnected broker was indistinguishable from "nothing to send".
+**`publish_call_ok` is not delivery confirmation.** At QoS 0
+`esp_mqtt_client_publish()` returns once the client has accepted the request into
+its outbound queue. It says nothing about whether the broker received the packet,
+and certainly nothing about whether an application processed it. Confirming
+delivery would need QoS 1, `MQTT_EVENT_PUBLISHED` and server-side receipt
+validation — all future work, none of it implemented here.
+
+The scheduler's upload baseline follows the *decision*, not the transport outcome,
+so that the offline simulator and the device run the same policy; that is what the
+Python/C parity test checks. A non-zero `call_failed` in the log is what makes a
+dead broker diagnosable.
 
 ## MQTT payload schema
 
 ```json
 {
   "device_id": "node-01",
-  "timestamp": 123456,
+  "timestamp": 1234567890,
   "temperature": 24.10,
   "humidity": 45.20,
-  "pressure": 1012.20,
-  "light": 320.0,
-  "sampling_interval": 20.0,
+  "pressure": 1012.30,
+  "light": null,
+  "sampling_interval": 60.0,
   "state": "STABLE",
-  "event": false
+  "event": false,
+  "valid": {
+    "temperature": true,
+    "humidity": true,
+    "pressure": true,
+    "light": false
+  }
 }
 ```
+
+Two details that carry meaning:
+
+- **`null` for an unavailable channel.** The shipped build has no light sensor, so
+  `"light"` is `null` rather than `0`. A `0` would be indistinguishable from a
+  genuinely dark room.
+- **The `valid` map is always present**, so a consumer never has to infer which
+  channels this build can actually measure.
+
+`tests/test_communication_payload.py` pins both, and re-measures the payload size
+that `payload_bytes_per_upload` claims.
 
 ## Known measurement weaknesses
 

@@ -13,15 +13,45 @@ CONFIG_SPIRAM_SPEED_80M=y
 
 # --- FreeRTOS ---
 CONFIG_FREERTOS_HZ=1000
-# Automatic light sleep (tickless idle) is deliberately left off: the duty cycle
-# is driven explicitly by power_sleep() in the main loop, so the node's timing
-# is observable and reproducible instead of being applied by the idle task.
-CONFIG_FREERTOS_USE_TICKLESS_IDLE=n
 
-# --- Power management ---
-# The dynamic frequency scaling / automatic light sleep governor is not used;
-# esp_light_sleep_start() is called explicitly for each scheduled sleep.
-CONFIG_PM_ENABLE=n
+# =====================================================================
+# Power management — ESP-IDF automatic light sleep
+#
+# The duty cycle is driven by `vTaskDelay()` in the main loop (see
+# firmware/main/power_mgmt.c). While the scheduler is idle, the ESP-IDF PM
+# subsystem puts the chip into light sleep, and the Wi-Fi driver holds or
+# releases its PM locks so that the modem state is part of that decision
+# (modem sleep between DTIM beacons). The application never calls
+# esp_light_sleep_start() itself.
+#
+# This is the strategy Espressif documents under "Wi-Fi and light sleep":
+#   Wi-Fi modem sleep (WIFI_PS_MIN_MODEM) + FreeRTOS tickless idle
+#   + CONFIG_PM_ENABLE + esp_pm_configure(light_sleep_enable = true)
+# =====================================================================
+CONFIG_PM_ENABLE=y
+
+# Automatic light sleep: FreeRTOS enters light sleep when no task needs to run
+# for CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP ticks. Requires PM_ENABLE.
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+# 8 ticks at FREERTOS_HZ=1000 is 8 ms: long enough not to sleep inside short
+# internal waits (MQTT/TLS housekeeping), far below the node's 5-60 s intervals.
+CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP=8
+
+# Lets power_mgmt.c register enter/exit callbacks. This is the only way the
+# application can observe how often the chip really entered light sleep and for
+# how long; without it we would be guessing. See power_get_stats().
+CONFIG_PM_LIGHT_SLEEP_CALLBACKS=y
+
+# Dynamic frequency scaling is deliberately NOT used: the node has no CPU-bound
+# work, so esp_pm_configure() sets max == min and the value of DFS would be nil.
+# Leaving PM_DFS_INIT_AUTO off means light sleep is only entered after the
+# application calls esp_pm_configure() itself, keeping the behaviour explicit.
+CONFIG_PM_DFS_INIT_AUTO=n
+
+# IRAM placement of light-sleep and idle code is left at the defaults: it buys a
+# few hundred microseconds of extra sleep per cycle at the cost of IRAM budget,
+# which is not what this version is trying to optimise (and cannot be validated
+# without a power measurement anyway).
 
 # --- Application memory ---
 # The change detector and scheduler live in static storage (see main.c), so the
@@ -29,6 +59,8 @@ CONFIG_PM_ENABLE=n
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
 
 # --- Logging ---
+# The per-cycle INFO line is the on-device data log. Set this to WARN before an
+# energy measurement: the UART keeps the chip awake and draws current.
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
 # --- Components required by the application ---

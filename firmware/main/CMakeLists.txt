@@ -21,10 +21,12 @@ idf_component_register(
         "main.c"
         "policy_config.c"
         "sensor.c"
+        "sensor_supervisor.c"
         "bme280_math.c"
         "change_detector.c"
         "adaptive_scheduler.c"
         "communication.c"
+        "communication_payload.c"
         "power_mgmt.c"
     INCLUDE_DIRS "."
     REQUIRES
@@ -35,4 +37,5 @@ idf_component_register(
         mqtt
         driver
         esp_timer
+        esp_pm
 )

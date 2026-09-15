@@ -55,6 +55,34 @@ driver never blocks indefinitely. If the measurement does not complete, the
 sample is marked failed and the main loop retries after the minimum interval
 instead of feeding a stale or zeroed reading to the detector.
 
+### Bring-up, and why a failed sensor is not a reading of zeros
+
+`sensor_init()` returns 0 only when the chip answered, the calibration parsed and
+the configuration was written; `sensor.c` records that and `sensor_read()` refuses
+to do anything until it is true, leaving the caller's buffer untouched. The
+contract is enforced in the driver and asserted on the host by
+`tests/test_sensor_contract.py`.
+
+When to *retry* bring-up is a separate decision, and it lives in
+`sensor_supervisor.c` (pure C, host-tested, `tests/test_sensor_supervisor.py`):
+
+```
+while the sensor has never come up:
+    if now >= next_attempt_t:
+        ok = sensor_init()
+        note_attempt(now, ok)        # failure schedules the next attempt at now + min_interval
+```
+
+So a board whose BME280 is detached at boot — or connected later — recovers by
+itself, at one attempt per `min_interval`, instead of producing an endless stream
+of failed reads and an unusable node. The counters (`init_attempts`,
+`init_failures`) are logged.
+
+This matters beyond tidiness: the change detector's EMA baseline is fed by
+whatever `sensor_read()` returns. Zeros from a dead sensor would be absorbed as
+measurements and the node would report a room at 0 °C rather than reporting that
+it cannot measure.
+
 ### Calibration and compensation
 
 Register map used (BME280 datasheet, Table 16):
@@ -101,32 +129,44 @@ is never presented as a measurement.
 | item | status |
 |------|--------|
 | Firmware compiles for `esp32s3` | **Yes** — ESP-IDF v5.4.4, 0 warnings ([build_validation.md](build_validation.md)) |
-| Host unit tests of the driver maths | **Yes** — `tests/test_bme280_math.py`, including parsing and bounds |
+| Host tests of the driver maths | **Yes** — `tests/test_bme280_math.py`: calibration parsing, nibble assembly, compensation against the vendor equations |
+| Host tests of the bring-up contract | **Yes** — `tests/test_sensor_contract.py`, `tests/test_sensor_supervisor.py` |
+| Power-management configuration | **Yes, in the build** — `CONFIG_PM_ENABLE=y`, tickless idle and light-sleep callbacks confirmed in the generated sdkconfig |
 | On-device sensor reading | `Not measured yet.` |
 | I²C bus bring-up / address probe | Implemented, `Not measured yet.` on hardware |
 | Wi-Fi + MQTT publish to a live broker | Implemented, `Not measured yet.` on hardware |
+| Light-sleep entry on hardware | Implemented and observable (`light_sleep_entries`), `Not measured yet.` |
 | Power / energy measurement | `Not measured yet.` |
 
 ## Energy / power measurement
 
 AdaptiveSense does **not** perform real energy measurement, and this repository
 reports no energy in physical units. The available quantities are
-`number_of_uploads`, `estimated_payload_bytes` and a dimensionless
-`communication_energy_proxy`.
+`number_of_uploads`, `estimated_payload_bytes` (from a measured 246-byte payload)
+and a dimensionless `upload_energy_proxy`.
+
+`esp_wifi_set_ps(WIFI_PS_MIN_MODEM)` is a **Wi-Fi modem power-save mode**, not a
+power measurement and not evidence that the node is low-power. It lets the radio
+sleep between DTIM beacons; whether the device actually saves energy is exactly
+what has not been measured.
 
 To obtain real numbers:
 
 1. Put a current monitor on the 3.3 V rail (INA219/INA226, Joulescope, or a
    Nordic Power Profiler Kit II).
 2. Record active, transmit and light-sleep currents separately.
-3. Combine them with the per-phase durations that `power_mgmt.c` already measures
-   (`power_get_stats()` returns the summed requested and actual sleep time).
+3. Combine them with the per-phase durations. `power_get_stats()` already reports
+   the two sides of the duty cycle: what the application asked for
+   (`sleep_requests`, `scheduled_idle_s`) and what the chip actually did
+   (`light_sleep_entries`, `light_sleep_s`, from the PM callback). If those two
+   diverge, something is holding a PM lock and the node is not sleeping as often
+   as the schedule suggests — worth knowing before attaching the meter.
 4. Store the result under `results/hardware/` with the instrumentation described,
    clearly labelled as a measurement rather than a simulation.
 
 ### Sleep modes
 
-See [power_management.md](power_management.md). Summary: `none` (FreeRTOS delay)
-and `light` (default) are supported; `deep` is rejected at compile time because a
-reboot would discard the detector's EMA baselines, the ladder position and the
-event debounce state.
+See [power_management.md](power_management.md). Summary: `none` (vTaskDelay only)
+and `auto light` (default, via ESP-IDF automatic light sleep) are supported; deep
+sleep is rejected at compile time because a reboot would discard the detector's
+EMA baselines, the ladder position and the event debounce state.

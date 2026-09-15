@@ -3,28 +3,31 @@
  *
  * Documented duty cycle (one iteration):
  *
- *   SLEEP until the scheduled sample time
+ *   IDLE until the scheduled sample time   (vTaskDelay; the ESP-IDF power manager
+ *                                           may enter light sleep while idle)
  *   -> READ SENSOR            (forced-mode BME280 conversion)
  *   -> EVALUATE CHANGE        (change_detector: score + debounced event)
  *   -> ADAPTIVE SCHEDULER     (state, next interval, upload decision)
- *   -> PUBLISH if requested   (and record whether the broker accepted it)
+ *   -> PUBLISH if requested   (and record whether the MQTT client took it)
  *   -> DETERMINE NEXT WAKE
  *
  * The layers (sensor / change detection / adaptive scheduler / communication /
- * power management) are wired here and never know about each other directly.
- * The configuration is built by policy_config.c so that the device and the
- * host-side parity test run the identical policy configuration.
+ * power management) are wired here and never know about each other directly. The
+ * configuration is built by policy_config.c so that the device and the host-side
+ * parity test run the identical policy configuration.
  *
- * Three behaviours differ from v0.1 and are deliberate:
+ * Three behaviours are deliberate and are what an earlier revision got wrong:
  *
- *  1. A failed sensor read does NOT feed a zeroed sample into the change
- *     detector. The EMA baseline would be poisoned by the zeros, so the node
- *     retries after `min_interval` instead.
- *  2. `upload_requested` (the policy decision) and `publish_success` (the
- *     transport outcome) are logged and counted separately. v0.1 discarded the
- *     publish return value, so a dead broker was invisible.
- *  3. The sleep mode is stated at boot and never aliases deep sleep onto a light
- *     sleep call.
+ *  1. A failed sensor read never becomes a sample. The detector's EMA baseline
+ *     would be poisoned by zeros, so the node retries after `min_interval`
+ *     instead. If the sensor has never come up at all, the supervisor limits
+ *     re-initialisation to one attempt per `min_interval` — the node recovers by
+ *     itself instead of failing forever.
+ *  2. `upload_requested` (the policy decision) and `publish_call_ok` (whether the
+ *     MQTT client accepted the request) are logged and counted separately.
+ *  3. Sleeping goes through the ESP-IDF power manager rather than a direct
+ *     `esp_light_sleep_start()`, so the Wi-Fi driver participates in the
+ *     sleep decision. See power_mgmt.h.
  */
 #include <math.h>
 #include <stdio.h>
@@ -38,10 +41,11 @@
 #include "adaptive_scheduler.h"
 #include "change_detector.h"
 #include "communication.h"
-#include "config.h"
+#include "config_include.h"
 #include "policy_config.h"
 #include "power_mgmt.h"
 #include "sensor.h"
+#include "sensor_supervisor.h"
 
 static const char *TAG = "main";
 
@@ -67,15 +71,21 @@ static bool  g_valid[CD_NUM_CHANNELS];
 void app_main(void)
 {
     ESP_LOGI(TAG, "AdaptiveSense node booting (device=%s)", CONFIG_AS_DEVICE_ID);
-    ESP_LOGI(TAG, "sleep mode: %s", power_sleep_mode_name(power_sleep_mode()));
-    ESP_LOGI(TAG, "BME280 measurement mode: forced (one conversion per sample)");
+
+    /* Power management first: arm automatic light sleep before anything starts
+     * acquiring PM locks, so the Wi-Fi driver sees the final configuration. */
+    if (power_init() != 0) {
+        ESP_LOGW(TAG, "power management not configured; the node will stay awake "
+                      "between samples");
+    }
 
     policy_build_detector_config(&g_cd_cfg);
     policy_build_scheduler_config(&g_sched_cfg);
 
-    if (sensor_init() != 0) {
-        ESP_LOGE(TAG, "sensor init failed; every sample will be retried");
-    }
+    /* Sensor bring-up is retried, not attempted once. */
+    sensor_supervisor_t sensor_sup;
+    sensor_sup_init(&sensor_sup, CONFIG_AS_MIN_INTERVAL_S,
+                    (double)esp_timer_get_time() / 1e6);
 
     if (communication_start() != 0) {
         ESP_LOGW(TAG, "communication start failed; publishes will count as failures");
@@ -94,26 +104,38 @@ void app_main(void)
     while (1) {
         cycle++;
 
-        /* ---- SLEEP until the scheduled sample time ---------------------- */
+        /* ---- IDLE until the scheduled sample time ----------------------- */
         double now = (double)esp_timer_get_time() / 1e6;
         if (next_wake > now) {
             power_set_phase(PM_SLEEP);
-            const double requested = next_wake - now;
-            const double slept = power_sleep(requested);
-            if (slept + 0.5 < requested) {
-                ESP_LOGD(TAG, "sleep returned early: requested %.2fs, got %.2fs",
-                         requested, slept);
-            }
+            power_sleep(next_wake - now);
             now = (double)esp_timer_get_time() / 1e6;
         }
         const double t_sample = now;
 
+        /* ---- SENSOR: (re)initialise if it has never come up ------------- */
+        if (!sensor_sup_ready(&sensor_sup) &&
+            sensor_sup_should_attempt(&sensor_sup, t_sample)) {
+            const bool ok = (sensor_init() == 0);
+            sensor_sup_note_attempt(&sensor_sup, t_sample, ok);
+            if (ok) {
+                ESP_LOGI(TAG, "sensor initialised after %u attempt(s)",
+                         sensor_sup.init_attempts);
+            } else {
+                ESP_LOGW(TAG, "sensor init failed (%u attempt(s)); retrying no "
+                              "sooner than %ds from now",
+                         sensor_sup.init_attempts, (int)CONFIG_AS_MIN_INTERVAL_S);
+            }
+        }
+
         /* ---- READ SENSOR ------------------------------------------------ */
         power_set_phase(PM_SAMPLE);
         sensor_read_t reading;
-        if (sensor_read(&reading) != 0) {
-            ESP_LOGW(TAG, "sensor read failed at cycle %lu; retrying in %ds",
-                     cycle, (int)CONFIG_AS_MIN_INTERVAL_S);
+        if (!sensor_sup_ready(&sensor_sup) || sensor_read(&reading) != 0) {
+            ESP_LOGW(TAG, "no usable reading at cycle %lu (sensor %s); next "
+                          "attempt in %ds",
+                     cycle, sensor_sup_state_name(&sensor_sup),
+                     (int)CONFIG_AS_MIN_INTERVAL_S);
             next_wake = t_sample + (double)CONFIG_AS_MIN_INTERVAL_S;
             continue;
         }
@@ -133,11 +155,11 @@ void app_main(void)
                   &decision);
 
         /* ---- DECIDE UPLOAD / TRANSPORT ---------------------------------- */
-        bool publish_success = false;
+        bool publish_call_ok = false;
         if (decision.upload_requested) {
             power_set_phase(PM_TRANSMIT);
-            publish_success =
-                communication_publish(t_sample * 1000.0, g_values,
+            publish_call_ok =
+                communication_publish(t_sample * 1000.0, g_values, g_valid,
                                       (comm_state_t)decision.state,
                                       decision.interval_s,
                                       decision.detected_event) == 0;
@@ -147,11 +169,11 @@ void app_main(void)
 
         ESP_LOGI(TAG,
                  "cycle=%lu t=%.1f state=%d interval=%.1fs score=%.2f "
-                 "event=%d upload_requested=%d publish_success=%d "
+                 "event=%d upload_requested=%d publish_call_ok=%d "
                  "temp=%.2f hum=%.2f",
                  cycle, t_sample, (int)decision.state, decision.interval_s,
                  (double)score, (int)decision.detected_event,
-                 (int)decision.upload_requested, (int)publish_success,
+                 (int)decision.upload_requested, (int)publish_call_ok,
                  (double)g_values[0], (double)g_values[1]);
 
         /* ---- DETERMINE NEXT WAKE ---------------------------------------- */
@@ -161,10 +183,10 @@ void app_main(void)
             const power_stats_t *pw = power_get_stats();
             communication_log_stats();
             ESP_LOGI(TAG,
-                     "duty cycle: sleeps=%lu light_ok=%lu light_failed=%lu "
-                     "sleep_requested=%.1fs sleep_actual=%.1fs",
-                     pw->sleep_calls, pw->light_sleep_ok, pw->light_sleep_failed,
-                     pw->requested_s, pw->actual_s);
+                     "duty cycle: idle_requests=%lu scheduled_idle=%.1fs "
+                     "light_sleep_entries=%lu light_sleep=%.1fs",
+                     pw->sleep_requests, pw->scheduled_idle_s,
+                     pw->light_sleep_entries, pw->light_sleep_s);
         }
     }
 }

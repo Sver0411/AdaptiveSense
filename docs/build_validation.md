@@ -41,18 +41,18 @@ comes from a cold build, not an incremental one.
 [116/116] ... Generated .../bootloader/bootloader.bin
 Bootloader binary size 0x51c0 bytes. 0x2e40 bytes (36%) free.
 [1060/1060] ... Generated .../AdaptiveSense.bin
-AdaptiveSense.bin binary size 0xd9d90 bytes.
-Smallest app partition is 0x100000 bytes. 0x26270 bytes (15%) free.
+AdaptiveSense.bin binary size 0xdc1e0 bytes.
+Smallest app partition is 0x100000 bytes. 0x23e20 bytes (14%) free.
 Project build complete.
 ```
 
 | artifact | size |
 |----------|------|
-| `build/AdaptiveSense.bin` | 892 304 bytes (`0xd9d90`) |
-| `build/AdaptiveSense.elf` | 9 809 068 bytes |
+| `build/AdaptiveSense.bin` | 901 600 bytes (`0xdc1e0`) |
+| `build/AdaptiveSense.elf` | 9 879 476 bytes |
 | `build/bootloader/bootloader.bin` | 20 928 bytes (`0x51c0`) |
 
-The application image fits the default 1 MiB app partition with 15 % headroom.
+The application image fits the default 1 MiB app partition with 14 % headroom.
 
 ## Reproducing
 
@@ -92,5 +92,29 @@ CI:
 |-------|---------|--------|
 | host compile of the on-device policy | `cc -std=c11 -Wall -Wextra -Werror -I firmware/main tests/c_host/parity_main.c firmware/main/{change_detector,adaptive_scheduler,policy_config}.c -lm` | PASS, no warnings |
 | host compile of the BME280 maths | `cc -std=c11 -Wall -Wextra -Werror -I firmware/main tests/c_host/bme280_host_main.c firmware/main/bme280_math.c -lm` | PASS, no warnings |
+| host compile of the MQTT payload builder | `cc -std=c11 -Wall -Wextra -Werror -I firmware/main tests/c_host/payload_host_main.c firmware/main/communication_payload.c` | PASS, no warnings |
+| host compile of the sensor layer (mock mode) | `cc -std=c11 -Wall -Wextra -Werror -DCONFIG_AS_USE_MOCK_SENSOR=1 -Itests/c_host/shims -Ifirmware/main tests/c_host/sensor_host_main.c firmware/main/{sensor,sensor_supervisor,bme280_math}.c -lm` | PASS, no warnings |
 | Python ↔ C policy parity | `python -m pytest tests/test_parity_python_c.py` | PASS (9 tests) |
-| configuration parity | `python scripts/check_config_parity.py` | PASS |
+| configuration parity | `python scripts/check_config_parity.py` | PASS (47 checks) |
+
+## Power-management configuration, verified in the generated sdkconfig
+
+`firmware/sdkconfig.defaults` is a set of *defaults*; what matters is the sdkconfig
+ESP-IDF actually generates. Checked after `idf.py set-target esp32s3`:
+
+```
+CONFIG_PM_ENABLE=y
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+CONFIG_PM_LIGHT_SLEEP_CALLBACKS=y
+CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP=8
+```
+
+That is the arrangement described in [power_management.md](power_management.md):
+the application idles with `vTaskDelay()`, FreeRTOS tickless idle enters light
+sleep, and the Wi-Fi driver's PM locks take part in the decision. Note that
+`CONFIG_FREERTOS_USE_TICKLESS_IDLE` **depends on** `CONFIG_PM_ENABLE`, so enabling
+one without the other would leave the node awake; `scripts/check_config_parity.py`
+checks both, plus the absence of a manual `esp_light_sleep_start()` in the source.
+
+This is a *configuration* verification. Whether the chip actually sleeps, and what
+it costs, is `Not measured yet.` — it needs a board and a current monitor.

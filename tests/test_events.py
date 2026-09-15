@@ -207,6 +207,86 @@ def test_scenarios_without_injected_disturbance_have_empty_labels():
 
 
 # ---------------------------------------------------------------------- #
+# the benchmark is described in two units, and they are not interchangeable
+# ---------------------------------------------------------------------- #
+def _load_generator():
+    """Import dataset/generate_dataset.py by path (it is a script, not a module).
+
+    The module has to be registered in `sys.modules` before it is executed:
+    it uses `from __future__ import annotations`, so `@dataclass` resolves the
+    annotations as strings by looking the defining module up in `sys.modules`.
+    """
+    import importlib.util
+
+    path = ROOT / "dataset" / "generate_dataset.py"
+    spec = importlib.util.spec_from_file_location("_as_generate_dataset", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(spec.name, None)
+        raise
+    return module
+
+
+def test_channel_labels_come_from_fewer_physical_disturbances():
+    """One injected disturbance can label several channels.
+
+    Humidity is coupled to temperature by the generator, so most physical
+    disturbances produce two labels. Reporting "24 events" without saying so
+    invites reading it as 24 independent phenomena, so the relationship is
+    asserted here rather than described in prose.
+    """
+    generator = _load_generator()
+    cfg = load_config()
+
+    total_labels = 0
+    total_disturbances = 0
+    for factory in generator.SCENARIOS:
+        spec = factory()
+        _, driven = generator.build(spec)
+        events = generator.label_events(driven, cfg)
+        total_labels += len(events)
+        total_disturbances += generator.count_disturbances(driven, cfg)
+
+        # Every physical disturbance must produce at least one label, and a
+        # disturbance can never produce fewer labels than 1.
+        assert generator.count_disturbances(driven, cfg) <= len(events)
+
+    assert total_labels == 24, (
+        f"{total_labels} channel-level labels; update the README if this changed"
+    )
+    assert total_disturbances == 13, (
+        f"{total_disturbances} injected physical disturbances; the README quotes "
+        f"this number, so update both together"
+    )
+
+
+def test_a_disturbance_that_moves_two_channels_counts_once():
+    """Direct check of the counting rule on a synthetic driven signal."""
+    generator = _load_generator()
+    cfg = load_config()
+    driven = {
+        "temperature": [0.0] * 100,
+        "humidity": [0.0] * 100,
+        "pressure": [0.0] * 100,
+        "light": [0.0] * 100,
+    }
+    # One disturbance that moves temperature and humidity together...
+    for i in range(20, 60):
+        driven["temperature"][i] = 5.0
+        driven["humidity"][i] = -20.0
+    # ...and one that moves only light.
+    for i in range(70, 95):
+        driven["light"][i] = 400.0
+
+    assert generator.count_disturbances(driven, cfg) == 2
+    assert len(generator.label_events(driven, cfg)) == 3
+
+
+# ---------------------------------------------------------------------- #
 # detection over an observed sample stream
 # ---------------------------------------------------------------------- #
 def test_detector_finds_a_sustained_step():

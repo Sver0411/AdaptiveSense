@@ -125,16 +125,16 @@ def plot_sampling_count(df) -> None:
     )
 
 
-def plot_communication_reduction(df) -> None:
+def plot_application_upload_reduction(df) -> None:
     """Grouped bar: upload reduction vs full 1 Hz reporting."""
     reduction = df.copy()
-    reduction["communication_reduction_pct"] = reduction["communication_reduction"] * 100.0
+    reduction["application_upload_reduction_pct"] = reduction["application_upload_reduction"] * 100.0
     _grouped_bars(
         reduction,
-        "communication_reduction_pct",
+        "application_upload_reduction_pct",
         "Communication reduction (%)",
         "Upload reduction relative to reporting every 1 Hz sample",
-        "communication_reduction.png",
+        "application_upload_reduction.png",
     )
 
 
@@ -223,7 +223,7 @@ def plot_tradeoff(summary) -> None:
         rate = _as_number(row.get("event_detection_rate"))
         if np.isnan(rate):
             continue
-        x = _as_number(row["communication_reduction"]) * 100.0
+        x = _as_number(row["application_upload_reduction"]) * 100.0
         y = rate
         name = str(row["strategy"])
         ax.scatter([x], [y], color=COLORS.get(name), s=70, zorder=3,
@@ -248,7 +248,7 @@ def render_all(df, summary=None) -> None:
     """Render every required plot for the metric tables."""
     ensure_dir()
     plot_sampling_count(df)
-    plot_communication_reduction(df)
+    plot_application_upload_reduction(df)
     plot_event_detection(df)
     plot_detection_latency(df)
     plot_tradeoff(summary)

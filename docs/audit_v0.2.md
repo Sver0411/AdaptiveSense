@@ -398,7 +398,7 @@ Legend for **Status**: `Confirmed` = reproduced by reading the code; `Verified`
 * **File**: `simulator/metrics.py:97`, `experiments/experiment_config.yaml:86-88`
 * **Root cause**: `energy_proxy_mj = uploads × 1.0` with no current, voltage or
   duration model. Presenting it in mJ invites reading it as a measurement.
-* **Fix**: rename to `communication_energy_proxy` (dimensionless units) and
+* **Fix**: rename to `upload_energy_proxy` (dimensionless units) and
   report `number_of_uploads` and `estimated_payload_bytes` as the primary
   quantities. Physical units are withheld until an INA219 / Joulescope /
   Power Profiler measurement exists.
@@ -577,13 +577,13 @@ ones in the README's *Reproduction* section.
 | 11 | `tests/test_scheduler.py::test_active_ladder_speeds_up`; `simulator/config.py` rejects `active: [60, 30, 15, 5]`, and `tests/test_config.py::test_rejects_the_v01_active_ladder` proves the rejection |
 | 12 | `tests/test_scheduler.py::test_delta_upload_is_normalised_by_the_noise_floor` and `…::test_delta_upload_uses_each_channels_own_noise_floor`; the C side passes the same noise floors (`policy_config.c`) and the parity test compares the resulting decisions |
 | 13 | `tests/test_scheduler.py::test_first_sample_is_uploaded` and `tests/test_parity_python_c.py::test_first_sample_is_uploaded_by_both` |
-| 14 | `communication_publish()` returns the outcome, `main.c` logs `upload_requested` and `publish_success` separately, and `communication_stats()` keeps `publish_ok` / `publish_failed` |
+| 14 | `communication_publish()` returns the outcome, `main.c` logs `upload_requested` and the transport result separately, and `communication_stats()` keeps accepted/rejected counters. **The counters are named `publish_call_ok` / `publish_call_failed` in v0.3**, because at QoS 0 the call only reports that the MQTT client accepted the request — not that the broker received or delivered the packet |
 | 15 | `CONFIG_AS_SLEEP_MODE` names the behaviour; the mode is logged at boot; `CONFIG_AS_SLEEP_MODE 2` fails the build with an explanation |
 | 16 | `analysis/analyze.py::write_sample_log` emits exactly one row per sample (decision fields merged in); verified against the regenerated `results/sim/*/AdaptiveSense.csv` |
 | 17 | `evaluation.event_match_tolerance_s` in the YAML, threaded through `compute_run_metrics()`; `tests/test_events.py::test_detection_within_tolerance_before_the_onset_matches` and `…::test_detection_just_outside_tolerance_does_not_match` |
 | 18 | `tests/test_metrics.py` latency tests (mean/median/p95, clamping, `None` when nothing matched); pooled aggregation test |
 | 19 | `tests/test_metrics.py::test_average_interval_uses_real_sample_differences` and `…::test_average_interval_is_none_for_a_single_sample` |
-| 20 | `tests/test_metrics.py::test_no_physical_energy_unit_is_reported`; the column is `communication_energy_proxy` throughout |
+| 20 | `tests/test_metrics.py::test_no_physical_energy_unit_is_reported`; the column is `upload_energy_proxy` throughout |
 | 21 | 7 scenarios / 24 labelled events; `tests/test_events.py::test_shipped_scenarios_have_labels` asserts ≥ 20 |
 | 22 | `tests/test_scheduler.py` asserts exact states and exact intervals (`test_stable_signal_backs_off_to_max_interval`, `test_active_ladder_speeds_up`, …) |
 | 23 | `scripts/check_config_parity.py` — 36 checks, run in CI |

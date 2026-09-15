@@ -10,22 +10,9 @@
 
 #include <string.h>
 
-/*
- * On the device, CMake provisions the git-ignored `config.h` from
- * `config.example.h`. In the host-side parity build there is no `config.h`, so
- * fall back to the committed example — which is the same file the device is
- * built from by default. This is what lets the host test exercise the exact
- * policy configuration the firmware uses.
- */
-#if defined(__has_include)
-#  if __has_include("config.h")
-#    include "config.h"
-#  else
-#    include "config.example.h"
-#  endif
-#else
-#  include "config.h"
-#endif
+/* Includes the device configuration, falling back to the committed example in a
+ * host-side build. See config_include.h. */
+#include "config_include.h"
 
 /* ------------------------------------------------------------------ */
 /* Channel configuration (mirrors adaptive.channels in the YAML)       */

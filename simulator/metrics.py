@@ -61,7 +61,7 @@ class RunMetrics:
     number_of_samples: int = 0
     sampling_reduction: float = 0.0
     number_of_uploads: int = 0
-    communication_reduction: float = 0.0
+    application_upload_reduction: float = 0.0
     estimated_payload_bytes: float = 0.0
     average_sampling_interval_s: Optional[float] = None
 
@@ -82,7 +82,7 @@ class RunMetrics:
     median_detection_latency_s: Optional[float] = None
     p95_detection_latency_s: Optional[float] = None
 
-    communication_energy_proxy: float = 0.0
+    upload_energy_proxy: float = 0.0
 
     # kept out of the CSV: the pooled latency list is needed for micro aggregation
     latencies: List[float] = field(default_factory=list)
@@ -97,7 +97,7 @@ class RunMetrics:
             "number_of_samples": self.number_of_samples,
             "sampling_reduction": round(self.sampling_reduction, 6),
             "number_of_uploads": self.number_of_uploads,
-            "communication_reduction": round(self.communication_reduction, 6),
+            "application_upload_reduction": round(self.application_upload_reduction, 6),
             "estimated_payload_bytes": self.estimated_payload_bytes,
             "average_sampling_interval_s": _round_or_na(self.average_sampling_interval_s),
             "n_gt_events": self.n_gt_events,
@@ -114,7 +114,7 @@ class RunMetrics:
             "avg_detection_latency_s": _round_or_na(self.avg_detection_latency_s),
             "median_detection_latency_s": _round_or_na(self.median_detection_latency_s),
             "p95_detection_latency_s": _round_or_na(self.p95_detection_latency_s),
-            "communication_energy_proxy": round(self.communication_energy_proxy, 6),
+            "upload_energy_proxy": round(self.upload_energy_proxy, 6),
         }
 
 
@@ -176,7 +176,7 @@ def compute_run_metrics(
         number_of_samples=n_samples,
         sampling_reduction=_rate(n_samples, n_ground_truth),
         number_of_uploads=int(uploads),
-        communication_reduction=_rate(uploads, n_ground_truth),
+        application_upload_reduction=_rate(uploads, n_ground_truth),
         estimated_payload_bytes=float(uploads) * float(payload_bytes),
         average_sampling_interval_s=avg_interval,
         n_gt_events=n_gt,
@@ -190,7 +190,7 @@ def compute_run_metrics(
         avg_detection_latency_s=mean(latencies) if latencies else None,
         median_detection_latency_s=median(latencies) if latencies else None,
         p95_detection_latency_s=percentile(latencies, 0.95),
-        communication_energy_proxy=float(uploads) * float(energy_units_per_upload),
+        upload_energy_proxy=float(uploads) * float(energy_units_per_upload),
         latencies=list(latencies),
     )
 
@@ -238,7 +238,7 @@ def aggregate_micro(runs: Sequence[RunMetrics]) -> Dict[str, object]:
         "number_of_samples": samples,
         "sampling_reduction": round(_rate(samples, n_gt_samples), 6),
         "number_of_uploads": uploads,
-        "communication_reduction": round(_rate(uploads, n_gt_samples), 6),
+        "application_upload_reduction": round(_rate(uploads, n_gt_samples), 6),
         "estimated_payload_bytes": sum(r.estimated_payload_bytes for r in runs),
         "average_sampling_interval_s": _round_or_na(avg_interval),
         "n_gt_events": n_gt_events,
@@ -259,7 +259,7 @@ def aggregate_micro(runs: Sequence[RunMetrics]) -> Dict[str, object]:
         ),
         "p95_detection_latency_s": _round_or_na(percentile(latencies, 0.95)),
         "matched_latency_samples": len(latencies),
-        "communication_energy_proxy": round(
-            sum(r.communication_energy_proxy for r in runs), 6
+        "upload_energy_proxy": round(
+            sum(r.upload_energy_proxy for r in runs), 6
         ),
     }

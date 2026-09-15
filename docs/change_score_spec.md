@@ -111,6 +111,26 @@ else:
 which `event_active` becomes true is an event onset (rising edge) and is used by
 the upload policy (§7) and by the offline event extraction.
 
+### Two different things are both called "an event"
+
+They are computed from the same score by the same rules, but they are not the
+same quantity, and the results table only ever reports the second one.
+
+| | **Online event** | **Evaluation event** |
+|---|---|---|
+| where | firmware / live scheduler | offline, in `simulator/events.py` |
+| input | one global score, `max` over all participating channels | each channel's own sampled stream, analysed separately |
+| output | a single boolean `event_active` | one `Event(channel, start_s, end_s)` interval per channel |
+| consumers | sampling control, the upload decision, the on-device log | event matching against the ground-truth labels, detection rate, latency |
+| why | the node needs one actionable "am I in a disturbance?" bit, and debouncing it once avoids channel-by-channel chatter in the control loop | comparing strategies requires the same per-channel extraction applied to every sampled stream, so a difference in the numbers comes from the sampling, not from the extraction |
+
+The two can legitimately disagree: a disturbance that moves only humidity raises
+the online flag exactly as a temperature disturbance does, while the offline
+detector attributes it to the humidity channel. A strategy's *detection rate* is
+therefore a statement about information retained in the sampled stream (§10), not
+an accuracy score for the firmware's flag. `docs/methodology.md` says the same
+thing in the reader-facing wording.
+
 ## 6. State machine
 
 Thresholds: `stable_threshold` (`S`), `active_threshold` (`A`),
@@ -211,12 +231,13 @@ the noise floor, so the same constant meant "2 noise floors" offline and
 `last_upload_request` and `last_upload_values[channel]` are updated **when
 `upload_requested` is true**. This keeps Python and firmware bit-comparable.
 
-> **`upload_requested` is not `publish_success`.** The firmware publishes the
+> **`upload_requested` is not `publish_call_ok`.** The firmware publishes the
 > packet and records the outcome separately (`communication_publish()` return
 > value). The scheduler baseline deliberately follows the *decision*, so that
 > the offline simulator and the device run the same policy; the transport
-> outcome is reported as its own counter and log field. See
-> `docs/methodology.md`.
+> outcome is reported as its own counter and log field. Note that at QoS 0
+> `publish_call_ok` means *the MQTT client accepted the request*, not that the
+> broker received or delivered the packet. See `docs/methodology.md`.
 
 ## 9. Offline event extraction (not ground truth)
 
@@ -319,9 +340,9 @@ No physical energy unit is reported. The available quantities are
 
 * `number_of_uploads` — packets requested/transmitted,
 * `estimated_payload_bytes` = uploads × `payload_bytes_per_upload`,
-* `communication_energy_proxy` = uploads × `communication_energy_units_per_upload`
+* `upload_energy_proxy` = uploads × `upload_energy_units_per_upload`
   (dimensionless proxy units).
 
-`communication_energy_units_per_upload` is an invented constant. It must never be
+`upload_energy_units_per_upload` is an invented constant. It must never be
 reported in joules or mJ until a hardware measurement exists; v0.1 named the
 column `energy_proxy_mj`, which implied a measurement that was never made.

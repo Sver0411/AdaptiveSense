@@ -40,14 +40,15 @@ flowchart LR
 
 ## Layering
 
-### Sensor layer — `sensor.c`, `bme280_math.c`, `sensor.h`
+### Sensor layer — `sensor.c`, `sensor_supervisor.c`, `bme280_math.c`, `sensor.h`
 
 `bme280_math.c` is pure C99 with no ESP-IDF dependency: calibration parsing, raw
 register decoding and the vendor compensation equations, all host-testable.
-`sensor.c` owns I²C transport, chip bring-up, the forced-mode measurement
-sequence with its bounded wait, and the mapping into `sensor_read_t`. Splitting
-the maths out is what allows `tests/test_bme280_math.py` to verify the driver
-without a board.
+`sensor.c` owns I²C transport, chip bring-up, the forced-mode measurement sequence
+with its bounded wait, and the read contract — nothing is read before a successful
+init. `sensor_supervisor.c` is also pure C and holds the decision of *when* to
+retry bring-up (rate-limited, never a busy loop), so that policy is unit-tested
+rather than buried in the main loop.
 
 ### Change-detection layer — `change_detector.c`, `change_detector.h`
 
@@ -68,43 +69,49 @@ to any sensor, radio or timing driver — which is why it compiles on a host.
 
 Mirrors `simulator/adaptive.py`.
 
-### Communication layer — `communication.c`, `communication.h`
+### Communication layer — `communication.c`, `communication_payload.c`, `communication.h`
 
 Wi-Fi bring-up, the modem-sleep power save, and a thin esp-mqtt wrapper that
-publishes one JSON payload per requested upload. Every publish attempt is counted
-and its outcome returned, so `upload_requested` and `publish_success` are
-distinguishable in the log.
+publishes one JSON payload per requested upload. The payload format lives in
+`communication_payload.c`, which is pure C and host-tested — an unavailable
+channel is emitted as `null` with an explicit `valid` map rather than as a
+plausible `0`. Every publish attempt is counted and its outcome returned, so
+`upload_requested` and `publish_call_ok` are distinguishable in the log.
 
 ### Power-management layer — `power_mgmt.c`, `power_mgmt.h`
 
-`power_sleep()` (mode-configurable, returns the measured elapsed time) and
-`power_deep_sleep()` (documented primitive, rejected by the default
-configuration). Decoupled from the policy so power strategies can be compared
-without touching scheduling. It never stops the radio — see
+`power_init()` configures the ESP-IDF power manager (`esp_pm_configure()` with
+`light_sleep_enable`), `power_sleep()` idles with `vTaskDelay()` and lets FreeRTOS
+tickless idle put the chip into light sleep, and a PM callback records how often
+that actually happened. Decoupled from the policy so power strategies can be
+compared without touching scheduling. It never stops the radio — see
 [power_management.md](power_management.md).
 
-### Configuration layer — `policy_config.c`, `policy_config.h`
+### Configuration layer — `policy_config.c`, `policy_config.h`, `config_include.h`
 
 The one place where `CONFIG_AS_*` macros become `cd_config_t` / `as_config_t`.
 Because both `main.c` and the host-side parity harness call the same two
 functions, the parity test verifies the *device's* configuration rather than a
-copy of it. `scripts/check_config_parity.py` additionally checks that this file
-contains no numeric literals.
+copy of it. `config_include.h` holds the "use `config.h` if present, else the
+committed example" fallback in one place, which is what lets any of these files
+build on a workstation. `scripts/check_config_parity.py` additionally checks that
+`policy_config.c` contains no numeric literals.
 
 ## Data / control flow (one duty cycle)
 
 ```
-SLEEP until the scheduled sample time
+IDLE until the scheduled sample time   (vTaskDelay; ESP-IDF may enter light sleep)
   → READ SENSOR                 (bounded forced-mode conversion)
   → EVALUATE CHANGE             (score + debounced event)
   → ADAPTIVE POLICY             (state, next interval, upload decision)
-  → PUBLISH if requested        (outcome recorded)
+  → PUBLISH if requested        (MQTT client outcome recorded)
   → DETERMINE NEXT WAKE
 ```
 
 A failed sensor read does **not** push a zeroed sample into the detector — the
 EMA baseline would be poisoned by the zeros. The node retries after
-`min_interval` instead.
+`min_interval`; if the sensor has never come up, the same interval rate-limits
+re-initialisation.
 
 ## Offline pipeline
 
@@ -122,6 +129,23 @@ dataset/labels ─────┘                              │
 `simulator/replay.py` replays every strategy over the same signal;
 `dataset/labels/` supplies the ground truth and is never produced by the policy.
 
+## Host-side test harnesses
+
+Four of the firmware's translation units have no ESP-IDF dependency (or compile in
+mock mode behind the test shim in `tests/c_host/shims/`), which is what makes the
+following possible without an ESP32 on the desk:
+
+| driver | units under test | test module |
+|--------|------------------|-------------|
+| `tests/c_host/parity_main.c` | `change_detector.c`, `adaptive_scheduler.c`, `policy_config.c` | `test_parity_python_c.py` |
+| `tests/c_host/bme280_host_main.c` | `bme280_math.c` | `test_bme280_math.py` |
+| `tests/c_host/payload_host_main.c` | `communication_payload.c` | `test_communication_payload.py` |
+| `tests/c_host/sensor_host_main.c` | `sensor.c` (mock), `sensor_supervisor.c` | `test_sensor_contract.py`, `test_sensor_supervisor.py` |
+
+`tests/host_build.py` holds the shared compiler discovery and build flags, so a
+change to the build flags cannot be applied to one harness and forgotten in
+another.
+
 ## Repository layout
 
 ```
@@ -132,7 +156,7 @@ AdaptiveSense/
 ├── experiments/    central experiment configuration
 ├── analysis/       metrics tables and figures
 ├── scripts/        configuration parity check
-├── tests/          unit tests + host-side parity harness
+├── tests/          unit tests + host-side C harnesses
 ├── results/        simulation outputs
 └── docs/           specification, methodology, audit, engineering notes
 ```

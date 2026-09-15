@@ -106,12 +106,36 @@ adaptive:
   # Communication cost bookkeeping.
   # These are PROXY constants. No physical energy unit is claimed.
   energy:
-    payload_bytes_per_upload: 96
-    communication_energy_units_per_upload: 1.0   # dimensionless proxy
+    # Size of one MQTT payload as produced by the firmware's own builder
+    # (firmware/main/communication_payload.c) for the shipped configuration: a
+    # BME280-only build, so `"light": null` and `valid.light == false`, with a
+    # 10-digit millisecond timestamp: 246 bytes.
+    #
+    # It is a measurement of that form, not a wire-protocol frame size: the JSON
+    # is built with fixed precision, so the length moves with the number of
+    # integer digits in the readings. tests/test_communication_payload.py pins
+    # the shipped form against this value and documents the variation.
+    payload_bytes_per_upload: 246
+    upload_energy_units_per_upload: 1.0   # dimensionless proxy
 
   # Seed for the replay simulator's tie-breaking / noise, kept for
   # reproducible experiments.
   random_seed: 42
+
+# -------------------------------------------------------------
+# Firmware-only parameters (no effect on the simulation)
+# -------------------------------------------------------------
+# Kept here anyway so that there is exactly one place where a tunable value
+# lives, and so that scripts/check_config_parity.py can check the constraint
+# below. The firmware mirrors these into firmware/main/config.example.h.
+firmware:
+  # MQTT keepalive. Must be >= 2 x sampling.max_interval so that a sleeping node
+  # is never declared gone by the broker. Note that keepalive is itself traffic:
+  # the client sends PINGREQ and the broker replies, and that activity can wake
+  # the chip out of light sleep. This is one reason the reported upload metric is
+  # an application-payload metric, not a radio-traffic metric.
+  mqtt_keepalive_s: 120
+
 
 # -------------------------------------------------------------
 # Evaluation configuration (metrics only, not used by the node)

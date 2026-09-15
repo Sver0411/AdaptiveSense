@@ -31,8 +31,8 @@ as measurements, so they can never be confused with these numbers.
 | `number_of_samples` | readings the strategy took |
 | `sampling_reduction` | `1 − samples / n_ground_truth` |
 | `number_of_uploads` | packets the policy requested |
-| `communication_reduction` | `1 − uploads / n_ground_truth` |
-| `estimated_payload_bytes` | uploads × configured payload size |
+| `application_upload_reduction` | `1 − uploads / n_ground_truth` — **application payloads only**, see below |
+| `estimated_payload_bytes` | uploads × the measured size of one payload (246 bytes) |
 | `average_sampling_interval_s` | `mean(diff(sample_timestamps))`; `N/A` for a single sample |
 | `n_gt_events` | labelled events in the scenario |
 | `true_positives` | one-to-one matched events |
@@ -45,7 +45,32 @@ as measurements, so they can never be confused with these numbers.
 | `avg_detection_latency_s` | mean onset-to-onset latency of matched pairs, clamped at 0 |
 | `median_detection_latency_s` | median of the same list |
 | `p95_detection_latency_s` | 95th percentile of the same list |
-| `communication_energy_proxy` | uploads × a configured dimensionless constant |
+| `upload_energy_proxy` | uploads × a configured dimensionless constant |
+
+### `application_upload_reduction` is not a radio-traffic reduction
+
+The metric counts **application payload uploads** only. It excludes everything the
+radio does on its own:
+
+- Wi-Fi beacon reception
+- TCP ACKs
+- MQTT keepalive (PINGREQ / PINGRESP)
+- MQTT protocol overhead
+- reassociation and DHCP traffic
+
+A node whose uploads drop by 97 % has **not** reduced total radio traffic by 97 %;
+the MQTT keepalive alone guarantees background traffic. The column is named after
+what it measures for exactly this reason, and `upload_energy_proxy` carries the
+same qualification.
+
+### What the detection columns measure
+
+The detection columns describe **how much event information survived in the sampled
+stream**, scored by one shared offline per-channel detector. They are not an
+accuracy measurement of the firmware's global `event_active` flag — that flag drives
+scheduling and the upload decision, while the offline detector exists to score every
+strategy the same way. See
+[`../docs/change_score_spec.md`](../docs/change_score_spec.md) for both quantities.
 
 `metrics_summary.csv` uses **micro** aggregation: `sum(TP)/sum(GT)`, pooled
 counts, and latency recomputed over the pooled matched-pair list — never the mean
@@ -64,8 +89,8 @@ and leave `score` empty (they have no change score).
 
 ## Energy
 
-There is no energy column. `communication_energy_proxy` is
-`uploads × communication_energy_units_per_upload`, an invented dimensionless
+There is no energy column. `upload_energy_proxy` is
+`uploads × upload_energy_units_per_upload`, an invented dimensionless
 constant. It is `Not a measurement`, and an earlier revision of this project
 printed the same quantity in millijoules, which implied a measurement that had
 never been taken. Real energy requires a current monitor on hardware; see

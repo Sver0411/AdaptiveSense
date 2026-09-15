@@ -36,7 +36,9 @@ YAML_PATH = ROOT / "experiments" / "experiment_config.yaml"
 CONFIG_H = ROOT / "firmware" / "main" / "config.example.h"
 POLICY_CONFIG_C = ROOT / "firmware" / "main" / "policy_config.c"
 DETECTOR_H = ROOT / "firmware" / "main" / "change_detector.h"
+POWER_MGMT_C = ROOT / "firmware" / "main" / "power_mgmt.c"
 MAIN_CMAKE = ROOT / "firmware" / "main" / "CMakeLists.txt"
+SDKCONFIG_DEFAULTS = ROOT / "firmware" / "sdkconfig.defaults"
 
 # (yaml dotted path, C macro, expected kind)
 #   kind: "float"  scalar compared with a relative tolerance
@@ -80,6 +82,10 @@ SPEC: Sequence[Tuple[str, str, str]] = (
     ("adaptive.upload.on_interval_change", "CONFIG_AS_UP_ON_INTERVAL_CHANGE", "bool"),
     ("adaptive.upload.heartbeat_s", "CONFIG_AS_UP_HEARTBEAT_S", "float"),
     ("adaptive.upload.delta_threshold", "CONFIG_AS_UP_DELTA_THRESHOLD", "float"),
+
+    # Firmware-only parameters. They have no effect on the simulation, but they
+    # live in the same YAML so there is one place where a tunable value exists.
+    ("firmware.mqtt_keepalive_s", "CONFIG_AS_MQTT_KEEPALIVE_S", "float"),
 )
 
 REL_TOL = 1e-6
@@ -91,6 +97,18 @@ def strip_c_comments(text: str) -> str:
     text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
     text = re.sub(r"//[^\n]*", " ", text)
     return text
+
+
+def strip_hash_comments(text: str) -> str:
+    """Drop whole-line `#` comments (sdkconfig.defaults / shell style).
+
+    Needed because a comment in `sdkconfig.defaults` may legitimately mention an
+    option name, and a naive substring search would then treat an explanation as
+    a setting.
+    """
+    return "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
 
 
 def parse_defines(path: Path) -> Dict[str, str]:
@@ -231,6 +249,77 @@ def structural_checks() -> List[Tuple[str, bool, str]]:
         "power_mgmt.c does not stop Wi-Fi before sleeping",
         sleep_ok,
         "the radio must survive the sleep" if not sleep_ok else "ok",
+    ))
+
+    # --- power management: the sleep mechanism must be the ESP-IDF one -------
+    #
+    # The firmware is supposed to idle with vTaskDelay() and let the ESP-IDF
+    # power manager enter light sleep, so that the Wi-Fi driver's PM locks take
+    # part in the decision. Sleeping from the application layer (or leaving PM
+    # disabled) silently breaks that contract, so it is checked here rather than
+    # trusted.
+    power_c = strip_c_comments(POWER_MGMT_C.read_text(encoding="utf-8"))
+
+    manual_sleep = "esp_light_sleep_start" in power_c
+    results.append((
+        "power_mgmt.c does not call esp_light_sleep_start",
+        not manual_sleep,
+        "sleep must go through the ESP-IDF power manager" if manual_sleep else "ok",
+    ))
+
+    configures_pm = ("esp_pm_configure" in power_c) and ("light_sleep_enable" in power_c)
+    results.append((
+        "power_mgmt.c configures the PM subsystem (esp_pm_configure + light_sleep_enable)",
+        configures_pm,
+        "ok" if configures_pm else "automatic light sleep would never be armed",
+    ))
+
+    sdkconfig = strip_hash_comments(SDKCONFIG_DEFAULTS.read_text(encoding="utf-8"))
+    for option in ("CONFIG_PM_ENABLE=y",
+                   "CONFIG_FREERTOS_USE_TICKLESS_IDLE=y",
+                   "CONFIG_PM_LIGHT_SLEEP_CALLBACKS=y",
+                   "CONFIG_PM_DFS_INIT_AUTO=n"):
+        present = re.search(rf"^{re.escape(option)}\s*$", sdkconfig, flags=re.M) is not None
+        results.append((
+            f"sdkconfig.defaults sets {option}",
+            present,
+            "ok" if present else "missing",
+        ))
+
+    # Tickless idle only exists when PM is enabled, and the light-sleep observer
+    # only exists when tickless idle is on. Catching the pair together makes the
+    # dependency explicit rather than leaving it to a Kconfig prompt.
+    if "CONFIG_PM_ENABLE=y" in sdkconfig and "CONFIG_FREERTOS_USE_TICKLESS_IDLE=y" not in sdkconfig:
+        results.append((
+            "tickless idle is enabled whenever PM is enabled",
+            False,
+            "CONFIG_FREERTOS_USE_TICKLESS_IDLE depends on CONFIG_PM_ENABLE",
+        ))
+    else:
+        results.append(("tickless idle is enabled whenever PM is enabled", True, "ok"))
+
+    config_h_text = strip_c_comments(CONFIG_H.read_text(encoding="utf-8"))
+    rejects_deep = bool(re.search(
+        r"#if\s+CONFIG_AS_SLEEP_MODE\s*==\s*2\s*\n\s*#error", config_h_text))
+    results.append((
+        "config.example.h rejects deep sleep at compile time",
+        rejects_deep,
+        "ok" if rejects_deep else "deep sleep would silently reboot the node",
+    ))
+
+    keepalive_checked = bool(re.search(
+        r"#if\s+CONFIG_AS_MQTT_KEEPALIVE_S\s*<", config_h_text))
+    results.append((
+        "config.example.h cross-checks the MQTT keepalive against max_interval",
+        keepalive_checked,
+        "ok" if keepalive_checked else "no compile-time keepalive constraint",
+    ))
+
+    pm_in_requires = bool(re.search(r"^\s*esp_pm\s*$", cmake, flags=re.M))
+    results.append((
+        f"{MAIN_CMAKE.name} REQUIRES esp_pm",
+        pm_in_requires,
+        "ok" if pm_in_requires else "power_mgmt.c includes esp_pm.h",
     ))
 
     return results

@@ -1,14 +1,25 @@
 /*
  * communication.h — Communication Layer.
  *
- * Thin wrapper around the built-in esp-mqtt component. It publishes one JSON
- * payload per upload. Broker URI and credentials come from build-time
- * configuration (config.h); the committed template contains placeholders only.
+ * Wi-Fi bring-up, the modem-sleep power save, and a thin wrapper around the
+ * built-in esp-mqtt component that publishes one JSON payload per requested
+ * upload.
  *
- * The return value of `communication_publish()` is meaningful: it distinguishes
- * "the policy asked for an upload" from "the packet was handed to a connected
- * MQTT client". v0.1 ignored the return value, so a dead broker produced no
- * error, no log and no counter — the node looked healthy while sending nothing.
+ * What "publish succeeded" means here
+ * -----------------------------------
+ * `esp_mqtt_client_publish()` is asynchronous and, at QoS 0, returns as soon as
+ * the MQTT client has **accepted the request into its outbound queue**. It does
+ * not mean the broker received the packet, and it certainly does not mean an
+ * application on the far side processed it. The counters below therefore say
+ * `publish_call_ok` / `publish_call_failed`: the outcome of the call into the
+ * MQTT client. Confirming delivery would need QoS 1 plus `MQTT_EVENT_PUBLISHED`
+ * plus server-side receipt validation, which this version does not implement
+ * (see the README's Future work).
+ *
+ * This distinction matters because the policy's own "should I upload?" decision
+ * and the transport outcome are different things, and an earlier revision
+ * discarded the transport outcome entirely, so a dead broker looked exactly like
+ * an idle node.
  */
 #ifndef ADAPTIVESENSE_COMMUNICATION_H
 #define ADAPTIVESENSE_COMMUNICATION_H
@@ -26,32 +37,32 @@ typedef enum {
     COMM_ALERT       /* ALERT   */
 } comm_state_t;
 
-/* Transport outcome bookkeeping (see docs/methodology.md). */
+/* Transport bookkeeping. Every field is an observation of this node's own calls. */
 typedef struct {
-    unsigned long publish_requested; /* upload_requested == true          */
-    unsigned long publish_ok;        /* accepted by a connected client    */
-    unsigned long publish_failed;    /* not connected, or broker rejected */
+    unsigned long publish_requested;   /* upload_requested == true            */
+    unsigned long publish_call_ok;     /* MQTT client accepted the request    */
+    unsigned long publish_call_failed; /* not connected, or the call rejected */
     bool          mqtt_connected;
 } comm_stats_t;
 
 /* Start Wi-Fi + MQTT and enable the Wi-Fi modem-sleep power save. */
 int communication_start(void);
 
-/* True once the MQTT broker is connected and ready to publish. */
+/* True once the MQTT broker is connected and ready to accept a publish call. */
 bool communication_ready(void);
 
 /*
  * Publish one sensor+decision record.
  *
- * Values are the four channels; state, interval and event describe the
- * AdaptiveSense decision for this sample. Payload follows the JSON schema in
- * docs/methodology.md.
+ * `valid` marks which channels carry a real reading; an invalid channel is sent
+ * as JSON `null` (plus an explicit `valid` map) rather than as a plausible 0.
  *
- * Returns 0 if the packet was handed to a connected broker, -1 otherwise.
- * Every call is counted in `communication_stats()`.
+ * Returns 0 if the MQTT client accepted the request, -1 otherwise. Every call is
+ * counted in `communication_stats()`.
  */
 int communication_publish(double timestamp_ms,
                           const float values[4],
+                          const bool valid[4],
                           comm_state_t state,
                           float interval_s,
                           bool event);

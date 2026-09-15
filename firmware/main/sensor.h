@@ -33,11 +33,22 @@ typedef struct {
     bool  valid[SEN_CH_COUNT];
 } sensor_read_t;
 
-/* Initialise the sensor subsystem (I2C, BME280 or mock). */
+/* Initialise the sensor subsystem (I2C, BME280 or mock). Must succeed before
+ * sensor_read() will produce a reading. */
 int sensor_init(void);
 
-/* Take a single measurement. Returns 0 on success (partial validity is
- * signalled via sensor_read_t.valid). */
+/* True once sensor_init() has succeeded. */
+bool sensor_is_initialized(void);
+
+/*
+ * Take a single measurement. Returns 0 on success (partial validity is signalled
+ * via sensor_read_t.valid), or -1 if the subsystem is not initialised or the
+ * transfer failed.
+ *
+ * On failure `out` is left untouched: the caller must check the return value and
+ * must not treat the buffer as a measurement. Use of a supervisor
+ * (sensor_supervisor.c) to decide when to retry init is the caller's job.
+ */
 int sensor_read(sensor_read_t *out);
 
 /* Human-readable name of a channel, for logging/MQTT build-up. */
