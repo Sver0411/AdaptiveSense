@@ -293,7 +293,12 @@ git-ignored `config.h` from the committed example.
 
 Everything is deterministic (seeded generator, fixed configuration), so
 regenerating the datasets and rerunning the analysis reproduces the committed
-`results/` byte for byte. CI enforces that with `git diff --exit-code`.
+**numeric** results — the raw signals, labels and every metrics/sample CSV — byte
+for byte. CI enforces that with
+`git diff --exit-code -- 'dataset/**/*.csv' 'results/**/*.csv'`. Figures are
+regenerated and checked for existence rather than byte-identity, because PNG
+bytes depend on the plotting library build rather than on the experiment
+([details](results/README.md)).
 
 ## Limitations
 

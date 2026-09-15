@@ -78,5 +78,20 @@ python dataset/generate_dataset.py
 python analysis/analyze.py
 ```
 
-Both steps are deterministic, so the committed files are exactly what these
-commands produce; CI verifies that with `git diff --exit-code`.
+## What "reproducible" means here
+
+The guarantee covers the **numeric artefacts**: the raw signals, the ground-truth
+labels and every metrics/sample CSV. Regenerating them must not change a single
+byte, and CI enforces that with
+`git diff --exit-code -- 'dataset/**/*.csv' 'results/**/*.csv'`.
+
+The **figures are checked differently on purpose.** The byte content of a PNG
+depends on the matplotlib / freetype / harfbuzz builds, not on the experiment, so
+demanding byte-identity would pin the plotting library rather than the science
+(and would make the committed bytes churn on every dependency bump). What CI does
+verify is that the pipeline still renders all five figures and that none of them
+collapses to an empty image. The version string matplotlib would otherwise embed
+in a `tEXt` chunk is suppressed (`analysis/plots.py::_save`), so a dependency
+change cannot masquerade as a change in the results — `tests/test_plots.py` pins
+that.
+

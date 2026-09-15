@@ -50,11 +50,48 @@ jobs:
 
       - name: Results must be reproducible
         run: |
-          if ! git diff --exit-code; then
-            echo "::error::Regenerating the datasets or rerunning the analysis changed tracked files."
-            echo "::error::The committed results must be exactly what the pipeline produces."
+          set -o pipefail
+
+          # The reproducibility guarantee covers the NUMERIC artefacts: the
+          # measured dataset, the ground-truth labels and every metrics/sample
+          # CSV. Regenerating them must not change a single byte.
+          if ! git diff --exit-code -- 'dataset/**/*.csv' 'results/**/*.csv'; then
+            echo "::error::Regenerating the datasets or rerunning the analysis changed numeric results."
+            echo "::error::The committed CSVs must be exactly what the pipeline produces."
+            echo "----- changed numeric files -----"
+            git diff --name-only -- 'dataset/**/*.csv' 'results/**/*.csv'
             exit 1
           fi
+          echo "numeric artefacts: byte-identical after regeneration"
+
+          # Figures are a different matter and they are checked differently on
+          # purpose. The byte content of a PNG depends on the matplotlib,
+          # freetype and harfbuzz builds, not on the experiment, so requiring
+          # byte-identity would pin the plotting library instead of the science.
+          # What must hold is that the pipeline still renders every figure.
+          echo "----- regenerated figures -----"
+          for f in results/plots/*.png; do
+            size=$(stat -c %s "$f")
+            echo "  $(basename "$f"): ${size} bytes"
+            if [ "$size" -lt 10000 ]; then
+              echo "::error::$f is suspiciously small; the plot did not render"
+              exit 1
+            fi
+          done
+          expected=5
+          actual=$(ls -1 results/plots/*.png | wc -l)
+          if [ "$actual" -ne "$expected" ]; then
+            echo "::error::expected $expected figures, found $actual"
+            exit 1
+          fi
+
+          # Anything else that moved is a genuine reproducibility problem.
+          if ! git diff --exit-code -- . ':(exclude)dataset/**/*.csv' ':(exclude)results/**/*.csv' ':(exclude)results/plots/*.png'; then
+            echo "::error::The pipeline changed tracked files outside the expected outputs."
+            git diff --name-only -- . ':(exclude)dataset/**/*.csv' ':(exclude)results/**/*.csv' ':(exclude)results/plots/*.png'
+            exit 1
+          fi
+          echo "all reproducibility checks passed"
 
       - name: Upload simulation results
         if: always()

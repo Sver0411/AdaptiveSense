@@ -40,6 +40,19 @@ def ensure_dir() -> Path:
     return PLOTS_DIR
 
 
+def _save(fig, filename: str) -> None:
+    """Save a figure under ``results/plots/``.
+
+    The PNG text chunk that records the matplotlib version is suppressed, so the
+    byte content of a figure does not depend on which build of the plotting
+    library happens to be installed. Even so, figure bytes are **not** required to
+    be reproducible across machines (rasterisation depends on the freetype/harfbuzz
+    build); the reproducibility guarantee covers the numeric artefacts. See
+    `results/README.md`.
+    """
+    fig.savefig(ensure_dir() / filename, dpi=150, metadata={"Software": None})
+
+
 def _order_strategies(names) -> List[str]:
     ordered = [s for s in STRATEGIES if s in list(names)]
     ordered += [s for s in names if s not in STRATEGIES]
@@ -97,7 +110,7 @@ def _grouped_bars(df, column: str, ylabel: str, title: str, filename: str) -> No
     ax.legend(title="Strategy", ncol=3, fontsize=8)
     ax.grid(axis="y", linestyle=":", alpha=0.5)
     fig.tight_layout()
-    fig.savefig(ensure_dir() / filename, dpi=150)
+    _save(fig, filename)
     plt.close(fig)
 
 
@@ -159,7 +172,7 @@ def plot_event_detection(df) -> None:
     axes[0].legend(title="Strategy", fontsize=7, ncol=2)
     fig.suptitle("Event performance, scenarios that contain ground-truth events")
     fig.tight_layout()
-    fig.savefig(ensure_dir() / "event_detection.png", dpi=150)
+    _save(fig, "event_detection.png")
     plt.close(fig)
 
 
@@ -193,7 +206,7 @@ def plot_detection_latency(df) -> None:
     ax.legend(title="Strategy", ncol=3, fontsize=8)
     ax.grid(axis="y", linestyle=":", alpha=0.5)
     fig.tight_layout()
-    fig.savefig(ensure_dir() / "detection_latency.png", dpi=150)
+    _save(fig, "detection_latency.png")
     plt.close(fig)
 
 
@@ -227,7 +240,7 @@ def plot_tradeoff(summary) -> None:
     )
     ax.grid(linestyle=":", alpha=0.5)
     fig.tight_layout()
-    fig.savefig(ensure_dir() / "accuracy_efficiency_tradeoff.png", dpi=150)
+    _save(fig, "accuracy_efficiency_tradeoff.png")
     plt.close(fig)
 
 
