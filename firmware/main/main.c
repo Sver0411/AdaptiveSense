@@ -106,9 +106,11 @@ void app_main(void)
     policy_build_detector_config(&g_cd_cfg);
     policy_build_scheduler_config(&g_sched_cfg);
 
-    /* Sensor bring-up is retried, not attempted once. */
+    /* Sensor bring-up is retried, not attempted once, and a live sensor that
+     * stops answering is re-probed rather than logged as "ready" forever. */
     sensor_supervisor_t sensor_sup;
     sensor_sup_init(&sensor_sup, CONFIG_AS_MIN_INTERVAL_S,
+                    CONFIG_AS_SENSOR_FAILURES_BEFORE_UNAVAILABLE,
                     (double)esp_timer_get_time() / 1e6);
 
     if (communication_start() != 0) {
@@ -156,6 +158,14 @@ void app_main(void)
         power_set_phase(PM_SAMPLE);
         sensor_read_t reading;
         if (!sensor_sup_ready(&sensor_sup) || sensor_read(&reading) != 0) {
+            const bool became_unavailable =
+                sensor_sup_note_read_failure(&sensor_sup, t_sample);
+            if (became_unavailable) {
+                ESP_LOGE(TAG, "sensor became unavailable after %u consecutive read "
+                              "failures (%u in total); will re-probe",
+                         sensor_sup.read_failures_consecutive,
+                         sensor_sup.read_failures_total);
+            }
             ESP_LOGW(TAG, "no usable reading at cycle %lu (sensor %s); next "
                           "attempt in %ds",
                      cycle, sensor_sup_state_name(&sensor_sup),
@@ -168,6 +178,7 @@ void app_main(void)
             log_periodic_stats(cycle);
             continue;
         }
+        sensor_sup_note_read_success(&sensor_sup);
         memcpy(g_valid, reading.valid, sizeof(g_valid));
         for (int i = 0; i < CD_NUM_CHANNELS; i++) {
             g_values[i] = reading.value[i];

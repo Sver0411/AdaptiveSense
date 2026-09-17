@@ -126,3 +126,114 @@ def test_zero_retry_interval_still_counts_attempts(sensor_host):
 def test_state_name_reports_unavailable(sensor_host):
     output = run(sensor_host, "supervisor", 5.0, "1")
     assert "unavailable" in output
+
+
+# ---------------------------------------------------------------------- #
+# runtime failure and recovery
+#
+# The defect this pins down, found on hardware: once bring-up had succeeded, the
+# supervisor's `initialized` flag was never cleared, so a sensor unplugged while
+# the node ran produced "no usable reading ... (sensor ready)" forever — the state
+# claimed ready while every read failed — and `sensor_init()` was never called
+# again. Recovery happened only by luck, because the driver's device handle was
+# still registered and the part reappeared.
+# ---------------------------------------------------------------------- #
+def recovery_trace(sensor_host, *, retry, threshold, failures, reinit_t):
+    """Run the recovery scenario and return (steps by label, totals)."""
+    output = run(sensor_host, "recovery", retry, threshold, failures, reinit_t)
+    steps = {}
+    totals = {}
+    for line in output.strip().splitlines():
+        parts = line.split(",")
+        if parts[0] == "step":
+            steps[parts[1]] = {
+                "ready": int(parts[2]),
+                "should": int(parts[3]),
+                "state": parts[4],
+                "consecutive": int(parts[5]),
+                "events": int(parts[6]),
+            }
+        elif parts[0] == "totals":
+            totals = {
+                "init_attempts": int(parts[1]),
+                "init_failures": int(parts[2]),
+                "read_failures": int(parts[3]),
+                "unavailability_events": int(parts[4]),
+                "read_successes": int(parts[5]),
+            }
+    assert steps and totals, output
+    return steps, totals
+
+
+def test_a_live_sensor_is_ready(sensor_host):
+    steps, _ = recovery_trace(sensor_host, retry=5, threshold=3, failures=5, reinit_t=10)
+    assert steps["after-init"]["ready"] == 1
+    assert steps["after-init"]["state"] == "ready"
+    assert steps["after-init"]["should"] == 0
+
+
+def test_isolated_read_failures_are_tolerated(sensor_host):
+    """One bad transfer must not tear down a working driver."""
+    steps, _ = recovery_trace(sensor_host, retry=5, threshold=3, failures=5, reinit_t=10)
+    assert steps["fail-1"]["ready"] == 1
+    assert steps["fail-2"]["ready"] == 1
+    assert steps["fail-2"]["events"] == 0
+
+
+def test_the_state_does_not_claim_ready_while_reads_are_failing(sensor_host):
+    """The specific reporting defect: "ready" while nothing was being read."""
+    steps, _ = recovery_trace(sensor_host, retry=5, threshold=3, failures=5, reinit_t=10)
+    assert steps["fail-1"]["state"] == "ready (reads failing)"
+    assert steps["fail-1"]["state"] != "ready"
+
+
+def test_enough_consecutive_failures_mark_the_sensor_unavailable(sensor_host):
+    steps, totals = recovery_trace(sensor_host, retry=5, threshold=3, failures=5, reinit_t=10)
+    assert steps["fail-2"]["ready"] == 1, "not yet at the threshold"
+    assert steps["fail-3"]["ready"] == 0, "the threshold is where it drops out"
+    assert steps["fail-3"]["state"] == "unavailable (will retry)"
+    assert steps["fail-3"]["events"] == 1
+    assert totals["unavailability_events"] == 1
+    assert totals["read_failures"] == 5
+
+
+def test_bring_up_is_re_attempted_after_going_unavailable(sensor_host):
+    """The specific behavioural defect: `sensor_init()` must be reachable again.
+
+    Before the fix this was always false, so no re-probe could ever happen.
+    """
+    steps, _ = recovery_trace(sensor_host, retry=5, threshold=3, failures=3, reinit_t=10)
+    assert steps["fail-3"]["should"] == 1
+    assert steps["before-reprobe"]["should"] == 1
+
+
+def test_a_failed_re_init_is_rate_limited(sensor_host):
+    steps, totals = recovery_trace(sensor_host, retry=5, threshold=3, failures=3, reinit_t=10)
+    assert steps["after-failed-init"]["should"] == 0, "must not retry immediately"
+    assert steps["inside-retry-window"]["should"] == 0, "nor inside the interval"
+    assert totals["init_failures"] == 1
+
+
+def test_a_good_re_init_restores_the_sensor(sensor_host):
+    steps, totals = recovery_trace(sensor_host, retry=5, threshold=3, failures=5, reinit_t=10)
+    assert steps["after-good-init"]["ready"] == 1
+    assert steps["after-good-init"]["state"] == "ready"
+    assert steps["after-good-init"]["consecutive"] == 0, "a fresh init means a fresh device"
+    assert steps["after-good-read"]["ready"] == 1
+    assert totals["init_attempts"] == 3
+    assert totals["read_successes"] == 1
+
+
+def test_threshold_zero_reproduces_the_old_behaviour(sensor_host):
+    """The setting that reproduces the defect, so the difference is demonstrable.
+
+    With the threshold at 0 the sensor never drops out: the state stays "ready
+    (reads failing)" however many reads fail, and bring-up is never re-attempted.
+    That is exactly what was observed on hardware before the fix.
+    """
+    steps, totals = recovery_trace(sensor_host, retry=5, threshold=0, failures=20, reinit_t=10)
+    assert steps["fail-20"]["ready"] == 1, "never drops out"
+    assert steps["fail-20"]["should"] == 0, "so bring-up is never reachable again"
+    assert steps["fail-20"]["events"] == 0
+    assert totals["unavailability_events"] == 0
+    assert totals["read_failures"] == 20

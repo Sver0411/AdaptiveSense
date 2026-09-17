@@ -91,6 +91,8 @@ SPEC: Sequence[Tuple[str, str, str]] = (
     # Firmware-only parameters. They have no effect on the simulation, but they
     # live in the same YAML so there is one place where a tunable value exists.
     ("firmware.mqtt_keepalive_s", "CONFIG_AS_MQTT_KEEPALIVE_S", "float"),
+    ("firmware.sensor_failures_before_unavailable",
+     "CONFIG_AS_SENSOR_FAILURES_BEFORE_UNAVAILABLE", "int"),
 )
 
 REL_TOL = 1e-6

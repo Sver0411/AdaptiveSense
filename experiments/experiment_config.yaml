@@ -156,6 +156,11 @@ firmware:
   # an application-payload metric, not a radio-traffic metric.
   mqtt_keepalive_s: 120
 
+  # Consecutive read failures before a sensor that was working is considered
+  # gone and re-probed (firmware/main/sensor_supervisor.c). Firmware-only: the
+  # simulator replays stored signals and has no live sensor to lose.
+  sensor_failures_before_unavailable: 3
+
 
 # -------------------------------------------------------------
 # Evaluation configuration (metrics only, not used by the node)

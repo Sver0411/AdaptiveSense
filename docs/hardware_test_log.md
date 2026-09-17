@@ -567,6 +567,204 @@ separately instead of one "sleep" number.
 
 ---
 
+## Session 5 — 2026-09-17, stability and fault recovery
+
+Twenty-five minutes of unattended running with one injected sensor fault, then two
+network faults. Everything below is from the serial log and the broker log; nothing
+is inferred.
+
+### §1 Long run — PASS
+
+| | |
+|---|---|
+| duration | **25.2 min** (device uptime 1511 s) |
+| total cycles / successful samples | **89 / 89** |
+| read failures | 59 (all inside the injected sensor fault, §2) |
+| Wi-Fi connect / disconnect | 1 / **0** |
+| MQTT connect / disconnect / reconnects | 1 / 1 (the boot-time pre-association attempt) / **0** |
+| `upload_requested` / `publish_call_ok` | 36 / **35** |
+| **collector rows received** | **35 → difference 0** |
+| `light_sleep_entries` / `light_sleep_s` | **13 731 / 835.4 s** |
+| `scheduled_idle_s` / `idle_requests` | 1026.6 s / 139 |
+| **sleep ratio** (`light_sleep_s / scheduled_idle_s`) | **81.4 %** |
+| light-sleep counters monotonic | **yes**, over 14 samples |
+| panic / watchdog / reboot | **0 / 0 / 0** |
+| states seen | STABLE 19, ACTIVE 27, ALERT 43; `event=1` six times |
+| STABLE eventually reaches 60 s | **yes**; interval sequence `20,40,60 → 5,15,5,15,10,5 → 20,40,60` |
+
+The 60 s heartbeat and the 120 s keepalive both ran for the whole window: the
+collector's rows are 60 s apart in the settled phase, and the broker log shows
+`k120` with PINGREQ/PINGRESP exchanges.
+
+> **Not measured:** heap usage. The firmware does not log free heap, so "no memory
+> leak" cannot be claimed — only "no crash, no reboot, and the light-sleep counters
+> grew normally for 25 minutes". Adding a heap line would be a small change; it is
+> recorded here as an unmeasured item rather than asserted.
+
+### §2 Sensor runtime failure and recovery — FIXED AND RETESTED
+
+**Reproduced first, before any change.** With the previous firmware, pulling the
+sensor produced this every 5 s for the whole outage:
+
+```
+W main: no usable reading at cycle 4 (sensor ready); next attempt in 5s
+```
+
+The state said **ready** while every read failed, and there were **zero**
+`sensor init failed` lines — `sensor_init()` was never called again, because
+`initialized` was set once and never cleared. Recovery happened only by luck: the
+driver's device handle was still registered, so when the part reappeared the
+existing handle worked again.
+
+**Fix.** `sensor_supervisor.{c,h}` now track consecutive read failures and clear
+`initialized` once they reach `CONFIG_AS_SENSOR_FAILURES_BEFORE_UNAVAILABLE` (3),
+which makes bring-up reachable again under the same rate limit. The state name
+distinguishes `ready`, `ready (reads failing)` and `unavailable (will retry)`.
+Counters were added so an outage can be counted rather than inferred.
+`change_detector` and `adaptive_scheduler` were **not touched**, and a failed read
+still `continue`s before the detector, so nothing bad can reach the EMA.
+
+**Retested on hardware, same procedure.** The fault was injected by removing the
+whole sensor module for about five minutes:
+
+```
+[1173ms]   I sensor initialised after 1 attempt(s)                boot, healthy
+[241091ms] W no usable reading at cycle 7 (sensor ready (reads failing))   1st failure
+[246092ms] W no usable reading at cycle 8 (sensor ready (reads failing))   2nd, tolerated
+[251093ms] E sensor became unavailable after 3 consecutive read failures (3 in total); will re-probe
+[251094ms] W no usable reading at cycle 9 (sensor unavailable (will retry))
+[256145ms] W sensor init failed (2 attempt(s)); retrying no sooner than 5s from now
+...
+[526107ms] W sensor init failed (29 attempt(s))
+[536138ms] I sensor initialised after 30 attempt(s)               recovered via re-probe
+```
+
+* the state name is now honest at every step;
+* bring-up became reachable again and was attempted **29 times**, rate-limited;
+* recovery went through an actual **re-probe**, not a lucky stale handle;
+* the detector saw nothing during the outage: cycles jump from **6 to 66**, so
+  cycles 7–65 (59 failures) never reached it.
+
+**Two behaviours worth recording, neither a defect:**
+
+1. The re-probe cadence on hardware is **~10 s**, not the configured 5 s. The
+   supervisor schedules the next attempt at `t + retry_interval` while the main loop
+   also wakes at `t + retry_interval`, and `pdMS_TO_TICKS` truncation makes the loop
+   wake marginally early, so the `now >= next_attempt_t` test only passes on
+   alternate iterations. It still means "at most one attempt per interval", which is
+   what the limit is for. Left as is, and recorded rather than quietly tightened.
+2. The **first good sample after recovery reads as a large change** (score 14.93,
+   ALERT) because the EMA baseline is still where it was before the outage. Here the
+   temperature really had moved (the module was handled), so the report is correct.
+   Removing the effect entirely would mean rebuilding the baseline on recovery, which
+   is a behaviour change and was not done.
+
+**Tests added:** 8 in `tests/test_sensor_supervisor.py`, including one that sets the
+threshold to 0 to reproduce the old behaviour, so the difference is asserted rather
+than described.
+
+### §3 Wi-Fi failure and recovery — PASS, with a caveat about this test setup
+
+Two halves, because of a timing slip on my side.
+
+**Half 1, hotspot removed while the node ran normally** (what the protocol asked for):
+
+```
+W comm: Wi-Fi disconnected; reconnecting      ×32, every 2.41 s, over 74.7 s
+cyc=7 t=238.7 ... upload_requested=1 publish_call_ok=0
+panic / watchdog = 0,  read failures = 0
+```
+
+The reconnect attempts are bounded and evenly spaced — not a busy loop — though
+2.41 s is frequent: that is ESP-IDF's own reconnect cadence, not a backoff. The
+scheduler kept running on the same ladder throughout, and the failed upload was
+counted rather than hidden.
+
+**Half 2, network returns.** The node had rebooted when I restarted the capture
+tool, so this is the harder case: a cold boot with no network at all. It retried 13
+times, then when the hotspot reappeared:
+
+```
+[32479ms] wifi:state: init -> auth (0xb0) -> assoc -> run
+[32570ms] wifi:connected with <hotspot>, channel 6, rssi -40, security: WPA2-PSK
+[33687ms] comm: got ip 172.20.10.5
+[130087ms] I comm: MQTT connected                      ← automatic
+cyc=7 t=238.8 ... upload_requested=1 publish_call_ok=1  ← publishing resumed
+```
+
+The collector received the post-recovery payload (its last row's timestamp matches
+cycle 7), so the whole chain came back **with no intervention**. The reboot happened
+at the start of the capture, while the hotspot was still off — before there was
+anything to recover — so this is not "recovering by rebooting the node".
+
+**The caveat, and it is a real operational trap.** Between the two halves, MQTT
+failed for 97 s for a reason unrelated to the firmware: **when the hotspot went away,
+the Mac joined a different network** (`10.60.24.32`, gateway `10.60.255.254`) and the
+node's configured broker URI — a hard-coded `mqtt://172.20.10.3:1883` — pointed at an
+address that no longer existed on any shared subnet. The node kept retrying in a
+bounded way (`esp-tls: select() timeout` three times, ~15-25 s apart) and reconnected
+by itself within seconds of the Mac rejoining the hotspot.
+
+Two lessons for anyone repeating this:
+
+* **the Mac must stay on the hotspot** for the duration; if it roams, the node
+  cannot reach the broker no matter what the firmware does;
+* **a hard-coded broker IP is fragile.** The node has no way to discover the broker,
+  so if the address moves, the configuration must be rebuilt. mDNS or a static lease
+  would fix it; neither is implemented.
+
+### §4 MQTT broker failure and recovery — PASS
+
+Mosquitto was stopped at T+70 s and restarted at T+222 s; the node was not touched.
+
+```
+[16206ms]  MQTT connected
+[41128ms]  cyc=3 up=1 ok=1                             publishing normally
+[70384ms]  MQTT error / disconnected                   broker stopped
+[85421ms]  ... every 15.0 s, 11 attempts in total      bounded retry
+[121126ms] cyc=5 up=1 ok=0                             policy wanted to send, transport failed → counted
+[235756ms] MQTT connected                              broker back → reconnected in 14 s
+[241127ms] cyc=7 up=1 ok=1                             publishing resumed
+```
+
+* the node did not reboot and did not crash (0 panic/watchdog), and the sensor and
+  scheduler were unaffected — the interval ladder continued `40, 40, 60, 60` and
+  there were zero read failures;
+* retries were uniformly 15.0 s apart, i.e. bounded;
+* the broker log shows **both** clients reconnecting by themselves:
+  `New client connected from 172.20.10.5 as ESP32_a7A8A4 (p4, c1, k120)` and
+  `... from 172.20.10.3 as auto-A1C2FFEC...` (the collector).
+
+**Honest limitation.** The publish the node made at `cyc=5` was accepted by the
+broker but nobody was subscribed at that moment — the collector was still in its own
+reconnect backoff (paho backs off exponentially, ~83 s here), so it missed that one
+message. The node's `call_ok` is truthful; the equality "call_ok count == collector
+rows" only holds while the collector is continuously connected.
+
+### Two problems I caused myself during this session
+
+Recorded because they cost time and would cost anyone else the same:
+
+1. **Starting the broker with `nohup … &` inside a script killed it when the script
+   exited** (`Reloading config.` then gone). Background processes in this
+   environment need to be launched as managed background tasks to survive.
+2. **A "just look, do not reset" serial read still reset the board.** `pyserial`
+   drives DTR/RTS when the port is opened, which pulses the ESP32 auto-reset circuit;
+   setting them before `open()` is not sufficient. The node rebooted mid-session,
+   which is why §3 is split into two halves.
+
+### Not tested in this session
+
+* **BH1750, OLED and the soil sensor** — deliberately out of scope for this round.
+* **SNTP / wall-clock timestamps** — the payload still carries milliseconds since boot.
+* **Buffering or deferring the first sample**, which is still lost because the node
+  samples before Wi-Fi associates. Counted as `call_failed`, by design for now.
+* **MQTT TLS or authentication** — the broker ran anonymous.
+* **Heap usage over time** — no heap logging exists.
+* **Energy** — no current measurement was taken.
+
+---
+
 ## Method notes
 
 Two things were needed to test at all from a scripted session, and both are

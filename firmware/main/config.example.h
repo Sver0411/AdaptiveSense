@@ -107,6 +107,18 @@
 #define CONFIG_AS_BME280_I2C_ADDR     0x76
 #define CONFIG_AS_SHT30_I2C_ADDR      0x44
 
+/*
+ * How many consecutive read failures it takes to conclude that a sensor which
+ * WAS working has gone away, after which bring-up is re-attempted under the
+ * rate limit in sensor_supervisor.c.
+ *
+ * A threshold rather than a single failure on purpose: one bad CRC or one timed
+ * out transfer should not tear down a working driver. Set it to 0 to never drop
+ * out at runtime, which is the behaviour this replaced — and which, on hardware,
+ * logged "no usable reading ... (sensor ready)" forever while never re-probing.
+ */
+#define CONFIG_AS_SENSOR_FAILURES_BEFORE_UNAVAILABLE 3
+
 /* Forced-mode measurement timing for the BME280 backend (see
  * firmware/main/sensor_bme280.c). At oversampling x1/x1/x1 the datasheet's
  * worst-case conversion time is well under 20 ms; MEAS_SETTLE_MS lets the
