@@ -34,9 +34,18 @@
 ## 系统
 
 ```
-唤醒 → 读取 BME280（一次 forced 模式转换）→ 计算变化分数
+唤醒 → 读取传感器（经传感器抽象层）→ 计算变化分数
      → 自适应策略（状态、下一间隔、是否上传）
      → 按需通过 MQTT 上报 → 空闲到下一次采样时刻
+```
+
+传感器层是一个抽象，背后有两个后端。本仓库的构建跑在 **SHT30** 上；BME280 是另一个
+受支持的后端，编译进哪一个是配置选择——抽象层之上的任何代码都不知道二者的区别。
+
+```
+传感器抽象层  (sensor.c：API、读取契约、后端选择)
+├── SHT30 / SHT3x     温度 + 湿度            <- 本物理构建
+└── BME280            温度 + 湿度 + 气压
 ```
 
 ```mermaid
@@ -62,12 +71,26 @@ flowchart LR
 
 | 层 | 文件 | 职责 |
 |----|------|------|
-| 传感器 | `sensor.c`、`sensor_supervisor.c`、`bme280_math.c` | I²C 传输、forced 模式转换、初始化重试策略、Bosch 补偿算法 |
+| 传感器 | `sensor.c`、`sensor_backend.h`、`sensor_bus.c`、`sensor_supervisor.c`、`sensor_sht30.c`、`sht30_proto.c`、`sensor_bme280.c`、`bme280_math.c` | 传感器 API 与后端选择、共享 I²C 总线归属、初始化与恢复监督、两个芯片后端（SHT30 / BME280） |
 | 变化检测 | `change_detector.c` | 归一化不稳定性分数 + 去抖事件 |
 | 自适应策略 | `adaptive_scheduler.c` | 状态机、间隔阶梯、上传决策 |
 | 通信 | `communication.c`、`communication_payload.c` | Wi-Fi 生命周期、MQTT 上报、负载格式、上报计数 |
 | 电源 | `power_mgmt.c` | ESP-IDF 电源管理配置、空闲、可观测的睡眠统计 |
 | 配置 | `policy_config.c`、`config_include.h` | `config.h` 宏 → 运行时结构体 |
+
+传感器层细分——一个抽象，两个后端：
+
+| 文件 | 职责 |
+|------|------|
+| `sensor.c` | 传感器 API、读取契约、后端选择、mock 覆盖 |
+| `sensor.h` | 公开读取契约（`sensor_init` / `sensor_read`、逐通道有效性） |
+| `sensor_backend.h` | 芯片后端需要实现的接口 |
+| `sensor_bus.c` | 唯一的共享 I²C 总线：只创建一次、归它所有，后端绝不自己创建 |
+| `sensor_supervisor.c` | 初始化与运行时恢复监督：何时重试、何时判定“不再应答的传感器”不可用并重探 |
+| `sensor_sht30.c` | SHT30 / SHT3x 后端：把协议绑到真实总线上，串起一次测量 |
+| `sht30_proto.c` | 纯 C 的 SHT30 协议：CRC-8、帧解码、命令时序 |
+| `sensor_bme280.c` | BME280 后端：芯片 ID 校验、forced 模式寄存器时序 |
+| `bme280_math.c` | BME280 校准参数解析与补偿算法（纯 C） |
 
 各层之间没有反向依赖；策略层不引用任何传感器或无线驱动——这正是同一份 C 文件能够在
 主机上编译并参与一致性测试的原因。

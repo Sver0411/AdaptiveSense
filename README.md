@@ -43,14 +43,17 @@ measures how much that buys, and where it fails.
 WAKE → READ SENSOR (through the sensor abstraction) → SCORE CHANGE
      → ADAPTIVE POLICY (state, next interval, upload decision)
      → PUBLISH over MQTT if requested → IDLE until the next sample
+```
 
-The sensor layer is an abstraction with two backends behind it:
+The sensor layer is an abstraction with two backends behind it. The build in this
+repository runs on an **SHT30**; the BME280 is the other supported backend, and
+which one is compiled in is a configuration choice — nothing above the sensor layer
+knows the difference.
 
 ```
-sensor abstraction  (sensor.c: API, read contract, shared I2C bus)
-├── SHT30 / SHT3x     temperature + humidity      <- this physical build
+sensor abstraction  (sensor.c: API, read contract, backend selection)
+├── SHT30 / SHT3x     temperature + humidity        <- this physical build
 └── BME280            temperature + humidity + pressure
-```
 ```
 
 ```mermaid
@@ -76,12 +79,26 @@ flowchart LR
 
 | layer | file | responsibility |
 |-------|------|----------------|
-| sensor | `sensor.c`, `sensor_supervisor.c`, `bme280_math.c` | I2C transport, forced-mode conversion, bring-up retry policy, Bosch compensation maths |
+| sensor | `sensor.c`, `sensor_backend.h`, `sensor_bus.c`, `sensor_supervisor.c`, `sensor_sht30.c`, `sht30_proto.c`, `sensor_bme280.c`, `bme280_math.c` | sensor API and backend selection, shared I2C bus ownership, bring-up and recovery supervision, two chip backends (SHT30 / BME280) |
 | change detection | `change_detector.c` | normalised instability score + debounced event |
 | adaptive policy | `adaptive_scheduler.c` | state machine, interval ladder, upload decision |
 | communication | `communication.c`, `communication_payload.c` | Wi-Fi lifecycle, MQTT publish, payload format, publish counters |
 | power | `power_mgmt.c` | ESP-IDF power-management setup, idle, observed sleep statistics |
 | configuration | `policy_config.c`, `config_include.h` | `config.h` macros → runtime structs |
+
+The sensor layer in detail — one abstraction, two backends:
+
+| file | responsibility |
+|------|----------------|
+| `sensor.c` | sensor API, read contract, backend selection, mock override |
+| `sensor.h` | the public read contract (`sensor_init` / `sensor_read`, per-channel validity) |
+| `sensor_backend.h` | the interface a chip backend implements |
+| `sensor_bus.c` | the single shared I2C bus: created once, owned here, never by a backend |
+| `sensor_supervisor.c` | bring-up and runtime-recovery supervision: when to retry, when a sensor that stopped answering is declared unavailable and re-probed |
+| `sensor_sht30.c` | SHT30 / SHT3x backend: binds the protocol to the real bus, sequences a measurement |
+| `sht30_proto.c` | SHT30 protocol in pure C: CRC-8, frame decoding, command sequencing |
+| `sensor_bme280.c` | BME280 backend: chip-id check, forced-mode register sequence |
+| `bme280_math.c` | BME280 calibration parsing and compensation maths (pure C) |
 
 The layers have no back-references to each other, and the policy holds no
 reference to any sensor or radio driver — which is what lets the same C files be
