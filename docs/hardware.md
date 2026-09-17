@@ -13,19 +13,51 @@
 
 ## Wiring
 
-| BME280 pin | ESP32-S3 |
-|------------|----------|
-| VCC / VIN | 3.3 V |
-| GND | GND |
-| SDA | GPIO 4 (configurable) |
-| SCL | GPIO 5 (configurable) |
-| ADDR | GND (I²C address `0x76`) or 3.3 V (`0x77`) |
+### What this firmware actually needs
 
-Pins and the I²C address are configured in `firmware/main/config.h`
-(`CONFIG_AS_SENSOR_SDA_GPIO`, `CONFIG_AS_SENSOR_SCL_GPIO`,
-`CONFIG_AS_BME280_I2C_ADDR`). The driver uses the current ESP-IDF I²C master
-API (`driver/i2c_master.h`); the legacy `driver/i2c.h` API emits deprecation
-warnings from ESP-IDF v5.2 onwards.
+One sensor: a **BME280 or BMP280** breakout on I²C. Everything else the firmware
+uses (Wi-Fi, flash, PSRAM) is on the module itself.
+
+| ESP32-S3 pin | sensor pin | voltage | notes |
+|--------------|-----------|---------|-------|
+| **GPIO4** | SDA | 3.3 V logic | `CONFIG_AS_SENSOR_SDA_GPIO`. Free on ESP32-S3; not a strapping, USB, flash or console pin |
+| **GPIO5** | SCL | 3.3 V logic | `CONFIG_AS_SENSOR_SCL_GPIO` |
+| **3V3** | VCC / VIN | **3.3 V** | Do **not** use 5 V. Many breakouts have a regulator and level shifters and will *run* on 5 V, but they then pull SDA/SCL to 5 V, which is out of spec for the ESP32-S3 |
+| **GND** | GND | — | Common ground is required; the bus will not work reliably without it |
+| — | ADDR / SDO | tie to GND or 3V3 | **GND → address `0x76`** (the configured default). 3V3 → `0x77`, which needs `CONFIG_AS_BME280_I2C_ADDR` changed |
+
+Bus speed is `CONFIG_AS_I2C_FREQ_HZ` = 400 kHz. The driver enables the ESP32's
+internal pull-ups, but they are weak (~45 kΩ): for reliable 400 kHz operation use
+the pull-ups on the breakout board (most have 4.7 kΩ–10 kΩ) and keep the wires
+short, under about 15 cm.
+
+There is no BH1750 driver in this firmware, so nothing else needs wiring. See
+[`hardware_test_log.md`](hardware_test_log.md) for what is physically attached to
+the development board this project was tested on, and which of those modules the
+firmware can and cannot use.
+
+### Pins to leave alone
+
+| pins | why |
+|------|-----|
+| GPIO26 – GPIO32 | flash and the in-package octal PSRAM (`CONFIG_SPIRAM_CLK_IO=30`, `CONFIG_SPIRAM_CS_IO=26`) |
+| GPIO43 / GPIO44 | console UART to the USB bridge |
+| GPIO19 / GPIO20 | native USB D− / D+ on the ESP32-S3 |
+| GPIO0 / GPIO3 / GPIO45 / GPIO46 | strapping pins; a pull-up or pull-down here changes the boot mode |
+
+If you move the sensor to different pins, change
+`CONFIG_AS_SENSOR_SDA_GPIO` / `CONFIG_AS_SENSOR_SCL_GPIO` in
+`firmware/main/config.h` and rebuild. `scripts/check_config_parity.py` does not
+check these, because the simulator has no notion of a pin.
+
+To find a sensor you are unsure about, scan the bus rather than guessing:
+`i2c_master_probe()` across `0x08`–`0x77`. Be aware that a *floating* SCL line
+makes a naive scan report whole blocks of addresses as present; characterise the
+lines electrically first (see the method note in
+[`hardware_test_log.md`](hardware_test_log.md)).
+
+The driver uses the current ESP-IDF I²C master API (`driver/i2c_master.h`); the
+legacy `driver/i2c.h` API emits deprecation warnings from ESP-IDF v5.2 onwards.
 
 ## Driver
 

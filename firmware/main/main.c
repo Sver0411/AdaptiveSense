@@ -68,6 +68,29 @@ static as_t g_scheduler;
 static float g_values[CD_NUM_CHANNELS];
 static bool  g_valid[CD_NUM_CHANNELS];
 
+/*
+ * Periodic duty-cycle + transport summary.
+ *
+ * Called on every N-th cycle whether or not the sample succeeded: the two
+ * counters that matter here (what the application asked to sleep for, and what
+ * the chip actually did) are the only window onto the power behaviour, and a
+ * node that cannot read its sensor is precisely the node whose sleep behaviour
+ * needs looking at.
+ */
+static void log_periodic_stats(unsigned long cycle)
+{
+    if (cycle % STATS_LOG_EVERY_CYCLES != 0) {
+        return;
+    }
+    const power_stats_t *pw = power_get_stats();
+    communication_log_stats();
+    ESP_LOGI(TAG,
+             "duty cycle: idle_requests=%lu scheduled_idle=%.1fs "
+             "light_sleep_entries=%lu light_sleep=%.1fs",
+             pw->sleep_requests, pw->scheduled_idle_s,
+             pw->light_sleep_entries, pw->light_sleep_s);
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "AdaptiveSense node booting (device=%s)", CONFIG_AS_DEVICE_ID);
@@ -137,6 +160,11 @@ void app_main(void)
                      cycle, sensor_sup_state_name(&sensor_sup),
                      (int)CONFIG_AS_MIN_INTERVAL_S);
             next_wake = t_sample + (double)CONFIG_AS_MIN_INTERVAL_S;
+            /* Report the duty cycle here too. A node that cannot read its sensor
+             * is exactly the node whose sleep behaviour is worth seeing, and
+             * skipping it would leave the power-management state unobservable in
+             * the one case where it is most in question. */
+            log_periodic_stats(cycle);
             continue;
         }
         memcpy(g_valid, reading.valid, sizeof(g_valid));
@@ -178,15 +206,6 @@ void app_main(void)
 
         /* ---- DETERMINE NEXT WAKE ---------------------------------------- */
         next_wake = t_sample + (double)decision.interval_s;
-
-        if (cycle % STATS_LOG_EVERY_CYCLES == 0) {
-            const power_stats_t *pw = power_get_stats();
-            communication_log_stats();
-            ESP_LOGI(TAG,
-                     "duty cycle: idle_requests=%lu scheduled_idle=%.1fs "
-                     "light_sleep_entries=%lu light_sleep=%.1fs",
-                     pw->sleep_requests, pw->scheduled_idle_s,
-                     pw->light_sleep_entries, pw->light_sleep_s);
-        }
+        log_periodic_stats(cycle);
     }
 }

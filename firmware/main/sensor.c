@@ -107,6 +107,32 @@ static i2c_master_bus_handle_t s_bus = NULL;
 static i2c_master_dev_handle_t s_dev = NULL;
 static bme280_calib_t s_cal;
 
+/*
+ * Release anything a previous attempt left behind.
+ *
+ * `sensor_init()` is called again by the bring-up supervisor
+ * (sensor_supervisor.c), and `i2c_new_master_bus()` fails with
+ * ESP_ERR_INVALID_STATE while the port is still owned:
+ *
+ *     E i2c.common: I2C bus id(0) has already been acquired
+ *     E i2c.master: i2c_new_master_bus(993): I2C bus acquire failed
+ *
+ * Observed on hardware on the second bring-up attempt, and it made every retry
+ * fail — so a node whose sensor was connected after boot could never recover.
+ * Idempotent, and all failure paths below funnel through it.
+ */
+static void sensor_i2c_teardown(void)
+{
+    if (s_dev != NULL) {
+        i2c_master_bus_rm_device(s_dev);
+        s_dev = NULL;
+    }
+    if (s_bus != NULL) {
+        i2c_del_master_bus(s_bus);
+        s_bus = NULL;
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* register transport                                                  */
 /* ------------------------------------------------------------------ */
@@ -191,6 +217,10 @@ int sensor_init(void)
     s_sensor_initialized = true;
     return 0;
 #else
+    /* A retry must not inherit the previous attempt's bus. See
+     * sensor_i2c_teardown(). */
+    sensor_i2c_teardown();
+
     const i2c_master_bus_config_t bus_config = {
         .i2c_port = I2C_NUM_0,
         .sda_io_num = CONFIG_AS_SENSOR_SDA_GPIO,
@@ -202,7 +232,7 @@ int sensor_init(void)
     esp_err_t err = i2c_new_master_bus(&bus_config, &s_bus);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "i2c bus init failed: %s", esp_err_to_name(err));
-        return -1;
+        goto fail;
     }
 
     const i2c_device_config_t dev_config = {
@@ -213,7 +243,7 @@ int sensor_init(void)
     err = i2c_master_bus_add_device(s_bus, &dev_config, &s_dev);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "i2c device add failed: %s", esp_err_to_name(err));
-        return -1;
+        goto fail;
     }
 
     err = i2c_master_probe(s_bus, CONFIG_AS_BME280_I2C_ADDR,
@@ -221,25 +251,25 @@ int sensor_init(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "BME280 not responding at 0x%02x: %s",
                  (unsigned)CONFIG_AS_BME280_I2C_ADDR, esp_err_to_name(err));
-        return -1;
+        goto fail;
     }
 
     uint8_t chip_id = 0;
     err = bme_read_u8(BME280_REG_ID, &chip_id);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "chip id read failed: %s", esp_err_to_name(err));
-        return -1;
+        goto fail;
     }
     if (chip_id != BME280_CHIP_ID) {
         ESP_LOGE(TAG, "unexpected chip id 0x%02x (expected 0x%02x)",
                  (unsigned)chip_id, (unsigned)BME280_CHIP_ID);
-        return -1;
+        goto fail;
     }
 
     err = bme_write_u8(BME280_REG_RESET, BME280_RESET_CMD);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "reset failed: %s", esp_err_to_name(err));
-        return -1;
+        goto fail;
     }
     vTaskDelay(pdMS_TO_TICKS(10)); /* datasheet: 2 ms start-up, 10 ms is safe */
 
@@ -252,22 +282,22 @@ int sensor_init(void)
     err = bme_read_block(BME280_CALIB_BLOCK1_ADDR, block1, sizeof(block1));
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "calibration block 1 read failed: %s", esp_err_to_name(err));
-        return -1;
+        goto fail;
     }
     err = bme_read_block(BME280_CALIB_BLOCK2_ADDR, block2, BME280_CALIB_BLOCK2_LEN);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "calibration block 2 read failed: %s", esp_err_to_name(err));
-        return -1;
+        goto fail;
     }
     if (!bme280_parse_calibration(block1, block2, &s_cal)) {
         ESP_LOGE(TAG, "calibration parse failed");
-        return -1;
+        goto fail;
     }
 
     err = bme_write_u8(BME280_REG_CONFIG, BME280_CONFIG_VALUE);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "config write failed: %s", esp_err_to_name(err));
-        return -1;
+        goto fail;
     }
 
     s_sensor_initialized = true;
@@ -275,6 +305,12 @@ int sensor_init(void)
              (unsigned)CONFIG_AS_BME280_I2C_ADDR,
              (int)CONFIG_AS_BME280_MEAS_TIMEOUT_MS);
     return 0;
+
+fail:
+    /* Every failure releases the bus, so the next bring-up attempt starts from
+     * the same state as the first one. */
+    sensor_i2c_teardown();
+    return -1;
 #endif /* CONFIG_AS_USE_MOCK_SENSOR */
 }
 
