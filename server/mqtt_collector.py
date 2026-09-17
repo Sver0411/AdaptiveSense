@@ -27,7 +27,7 @@ from pathlib import Path
 
 FIELDS = [
     "device_id", "timestamp", "temperature", "humidity", "pressure", "light",
-    "sampling_interval", "state", "event",
+    "sampling_interval", "state", "event", "valid",
 ]
 
 
@@ -53,8 +53,15 @@ class Collector:
         except Exception as exc:
             print(f"[collector] invalid JSON: {exc}", file=sys.stderr, flush=True)
             return
-        # keep only known fields, in a stable order
-        row = {f: rec.get(f, "") for f in FIELDS}
+        # keep only known fields, in a stable order; nested values (the per-channel
+        # `valid` map) are kept as compact JSON rather than dropped, so a reader can
+        # still tell "the sensor reported 0" from "that channel has no sensor"
+        row = {}
+        for f in FIELDS:
+            value = rec.get(f, "")
+            if isinstance(value, (dict, list)):
+                value = json.dumps(value, separators=(",", ":"), sort_keys=True)
+            row[f] = value
         self.writer.writerow(row)
         self.csvfile.flush()
         print(f"[collector] {msg.topic}: {msg.payload.decode()}", flush=True)

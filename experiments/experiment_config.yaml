@@ -126,6 +126,12 @@ adaptive:
     #   CONFIG_AS_SENSOR_BACKEND=1 (BME280)  pressure valid   -> 246 bytes
     #   CONFIG_AS_SENSOR_BACKEND=2 (SHT30)   pressure invalid -> 244 bytes
     #
+    # 244 bytes is the size for a TEN-DIGIT millisecond timestamp. The firmware
+    # currently sends milliseconds SINCE BOOT, which is 5-6 digits early in a
+    # session, so a real payload measures 238-240 bytes on the wire (observed).
+    # The constant is a representative upper size, not an exact wire length; see
+    # docs/hardware_test_log.md, session 4, open item 2.
+    #
     # The value below matches the selected backend, and
     # tests/test_communication_payload.py derives the expected form from the same
     # configuration, so the two cannot drift apart.

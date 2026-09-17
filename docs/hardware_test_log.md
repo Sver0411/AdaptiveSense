@@ -416,6 +416,157 @@ it compiles, it looks reasonable, and it lies.
 
 ---
 
+## Session 4 — 2026-09-17, full network chain over a phone hotspot
+
+The node had never published anything: the broker URI and the Wi-Fi credentials
+were placeholders, so `publish_call_ok` had always been 0. This session closed the
+whole chain — sensor → policy → Wi-Fi → MQTT → broker → collector — on a phone
+hotspot, because the campus network was not available.
+
+### Setup
+
+| | |
+|---|---|
+| hotspot | an iPhone personal hotspot, `172.20.10.1/24` |
+| Mac | `172.20.10.3`, macOS firewall **off** |
+| node | `172.20.10.5` |
+| broker | Mosquitto **2.1.2** on the Mac, `listener 1883 0.0.0.0` + `allow_anonymous true` |
+| collector | `server/mqtt_collector.py --host 172.20.10.3 --topic 'adaptivesense/#'` |
+| credentials | written to `firmware/main/config.h` only, which is git-ignored; verified that no tracked file contains them |
+
+Note that Mosquitto 2.x binds to loopback unless a `listener` is given explicitly,
+so the `listener 1883 0.0.0.0` line is what makes the broker reachable from the
+node at all.
+
+### 1–3. Association, address, MQTT session
+
+```
+I (1700) wifi:state: init -> auth (0xb0)
+I (1709) wifi:state: auth -> assoc (0x0)
+I (1720) wifi:state: assoc -> run (0x10)
+I (1750) wifi:connected with 123, aid = 20, channel 6, BW20, bssid = 0a:5d:7f:d0:63:0f
+I (1751) wifi:security: WPA2-PSK, phy: bgn, rssi: -40, cipher(pairwise:0x3, group:0x3), pmf:0
+I (2803) comm: got ip 172.20.10.5
+```
+
+and on the broker side, independently:
+
+```
+New connection from 172.20.10.5:57953 on port 1883.
+New client connected from 172.20.10.5:57953 as ESP32_a7A8A4 (p4, c1, k120).
+```
+
+* association completes in about 1.7 s and the node gets `172.20.10.5`;
+* the hotspot negotiated **WPA2-PSK** — the firmware's
+  `threshold.authmode = WIFI_AUTH_WPA2_PSK` is therefore satisfied, and no
+  authentication-mode change was needed (this was the most likely failure);
+* `k120` is the **keepalive of 120 s** on the wire, which independently confirms
+  that wire-level change actually took effect, not just the config file;
+* **no client isolation**: the node reached the Mac on port 1883 directly, so the
+  fallback diagnosis plan (inspect the broker log for a connection attempt) was not
+  needed. The broker log is still the right discriminator if it ever is.
+
+### 4–5. Publishes actually land
+
+Portion of the node log, in which `publish_call_ok=1` appears for the first time:
+
+```
+cycle=1  t=0.3   state=0 interval=20.0s score=0.00  upload_requested=1 publish_call_ok=0 temp=27.79 hum=55.94
+cycle=2  t=20.2  state=0 interval=20.0s score=0.22  upload_requested=0 publish_call_ok=0 temp=27.82 hum=55.76
+cycle=3  t=40.0  state=1 interval=15.0s score=11.99 upload_requested=1 publish_call_ok=1 temp=29.60 hum=63.89
+cycle=4  t=54.9  state=1 interval=10.0s score=7.89  upload_requested=1 publish_call_ok=1 temp=29.43 hum=59.85
+...
+cycle=15 t=114.4 state=2 interval=5.0s  score=13.68 upload_requested=1 publish_call_ok=1 temp=29.22 hum=68.15
+```
+
+and the matching broker records:
+
+```
+Received PUBLISH from ESP32_a7A8A4 (d0, q0, r0, m0, 'adaptivesense/data', ... (239 bytes))
+Sending PUBLISH to auto-2F83460F-F40D-F2B4-9991-8D6E6C9399B4 (... 'adaptivesense/data', ...)
+```
+
+**Cross-check, which is the point of doing it this way:** the node counted
+`publish_call_ok=1` **15 times** in 200 s, and the collector's CSV contains
+**15 rows**. Exact agreement, so nothing was silently dropped between the two.
+
+The two `publish_call_ok=0` at the start are correct, not a fault: the node samples
+at t = 0.3 s and the Wi-Fi/MQTT session is only up at about t = 2.8 s, so the first
+upload is requested before there is anywhere to send it. The counters report it as
+`call_failed=1` rather than hiding it. See the open items.
+
+### 6. Field-by-field check of a received payload
+
+First row of `results/live/MQTT-net.csv`:
+
+| field | value | |
+|-------|-------|---|
+| `device_id` | `node-01` | as configured |
+| `timestamp` | `39995` | ms since boot (not epoch — see open items) |
+| `temperature` | `29.6` | matches the node log for that cycle exactly |
+| `humidity` | `63.89` | matches |
+| `pressure` | *(empty)* | JSON `null`; an SHT30 has no pressure channel |
+| `light` | *(empty)* | JSON `null`; no light driver |
+| `sampling_interval` | `15.0` | the ACTIVE rung at that moment |
+| `state` | `ACTIVE` | |
+| `event` | `False` | |
+| `valid` | `{"humidity":true,"light":false,"pressure":false,"temperature":true}` | the map agrees with the values: the two empty channels are exactly the two marked invalid |
+
+Over the 15 rows: states `ACTIVE` ×11 and `ALERT` ×4, temperature 28.13 – 29.85 °C,
+humidity 54.55 – 68.15 %RH — i.e. the payload tracks the same physical excursion
+the state machine was responding to.
+
+The collector's field list did not include `valid`, so that map was being dropped
+on the floor; it now records it (serialised as compact JSON). Without it, `pressure`
+and `light` would be blank with no way to tell "no sensor" from "reading missing".
+
+### 7–8. Several cycles, and light sleep finally happens
+
+29 sampling cycles over 200 s, and the duty-cycle summary printed twice:
+
+```
+comm: publish stats: requested=5  call_ok=4  call_failed=1 mqtt_connected=1
+main: duty cycle: idle_requests=9  scheduled_idle=89.7s  light_sleep_entries=1183 light_sleep=72.6s
+comm: publish stats: requested=11 call_ok=10 call_failed=1 mqtt_connected=1
+main: duty cycle: idle_requests=19 scheduled_idle=139.5s light_sleep_entries=1866 light_sleep=113.0s
+```
+
+**`light_sleep_entries` went from a permanent 0 to 1183 and then 1866.** This was
+the open question from session 1, and the cause is now confirmed rather than
+theorised: with placeholder credentials the Wi-Fi driver sat in a reconnect loop
+and held a PM lock continuously, so the chip never reached the idle state the power
+manager needs. Once the node associates and enters modem sleep, the driver releases
+that lock between DTIM beacons and automatic light sleep starts immediately.
+
+The two counters the v0.3 logging change introduced are what make this readable:
+`light_sleep_s / scheduled_idle_s` = 72.6 / 89.7 = **81 %** of the requested idle
+time is actually spent asleep. Note that `light_sleep_entries` (1183) is far larger
+than `idle_requests` (9) — the counter ticks per sleep/wake cycle *inside* an idle
+window, not per idle window, which is exactly why the two pairs are reported
+separately instead of one "sleep" number.
+
+### Open items after session 4
+
+1. **The first publish after boot is always lost.** The node samples at t = 0.3 s,
+   long before Wi-Fi associates at t ≈ 2.8 s, so the first upload is requested with
+   no transport. It is counted as `call_failed` rather than hidden. Fixing it means
+   deferring or buffering the first sample — a behaviour change, not a bug fix, so
+   it is recorded and left.
+2. **The payload is 238–240 bytes on the wire, not the documented 244.**
+   `payload_bytes_per_upload` was measured with a 10-digit millisecond timestamp;
+   the node actually sends *milliseconds since boot*, which is 5–6 digits early in a
+   session. The constant is a representative size and the difference is ~1.5 %, but
+   the assumption should be stated. Real epoch timestamps would need SNTP, which is
+   not implemented.
+3. **`timestamp` is uptime, not wall-clock time.** A collector cannot correlate the
+   stream with anything else without knowing the boot time. SNTP is future work.
+4. The broker runs with `allow_anonymous true` on a shared hotspot subnet. Fine for
+   a bench session, not for anything longer-lived.
+5. `light_sleep` numbers are still *observed* sleep, not *energy*. No current
+   measurement was taken: `Not measured yet.`
+
+---
+
 ## Method notes
 
 Two things were needed to test at all from a scripted session, and both are
