@@ -38,7 +38,7 @@ typedef struct {
  * a reading.
  *
  * Which chip this drives is a configuration choice
- * (CONFIG_AS_SENSOR_BACKEND): a BME280/BMP280 or an SHT30/SHT3x, or the mock
+ * (CONFIG_AS_SENSOR_BACKEND): a BME280 or an SHT30/SHT3x, or the mock
  * when CONFIG_AS_USE_MOCK_SENSOR is set. The caller does not need to know which:
  * a backend reports the channels it cannot measure by leaving them invalid.
  */
@@ -63,6 +63,30 @@ int sensor_read(sensor_read_t *out);
 
 /* Human-readable name of the active backend, for logs and the boot banner. */
 const char *sensor_backend_name(void);
+
+#if CONFIG_AS_USE_MOCK_SENSOR
+/*
+ * Mock-only test seams.
+ *
+ * Declared inside CONFIG_AS_USE_MOCK_SENSOR so they cannot be compiled into a
+ * normal device build. They exist because the contract's failure path — a failed
+ * re-init must leave the subsystem consistently unusable — is otherwise only
+ * reachable with hardware that can be unplugged mid-run.
+ */
+void sensor_mock_set_init_failure(bool should_fail);
+
+/* What the mock backend has seen. `backend_live` mirrors the device build's
+ * `s_active != NULL`, so a test can assert that a failed re-init left no handle
+ * behind for a subsequent read to use. */
+typedef struct {
+    unsigned init_calls;
+    unsigned init_failures;
+    unsigned read_calls;   /* reads that got past the contract */
+    bool     backend_live;
+} sensor_mock_stats_t;
+
+void sensor_mock_stats(sensor_mock_stats_t *out);
+#endif
 
 /* Human-readable name of a channel, for logging/MQTT build-up. */
 const char *sensor_channel_name(sen_channel_t c);

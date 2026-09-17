@@ -19,7 +19,7 @@ and upload decisions on a shared fixture.
 ```mermaid
 flowchart LR
     subgraph Node["ESP32-S3 node (firmware/)"]
-        SEN["sensor.c + bme280_math.c<br/>BME280 I2C, forced mode"] --> CD["change_detector.c<br/>score + debounced event"]
+        SEN["sensor abstraction<br/>SHT30 / BME280<br/>shared I2C bus"] --> CD["change_detector.c<br/>score + debounced event"]
         CD --> AS["adaptive_scheduler.c<br/>state / interval / upload"]
         AS --> COMM["communication.c<br/>Wi-Fi + MQTT"]
         AS --> PM["power_mgmt.c<br/>none / light sleep"]
@@ -50,7 +50,7 @@ backend; `sensor_backend.h` is the interface a chip driver implements:
 |------|------|
 | `sensor.c` | API, read contract, backend selection, mock override |
 | `sensor_backend.h` | the backend interface (`init` / `read` / `teardown`) |
-| `sensor_bme280.c` | BME280/BMP280 backend: temperature, humidity, pressure |
+| `sensor_bme280.c` | BME280 backend: temperature, humidity, pressure |
 | `sensor_sht30.c` | SHT30/SHT3x backend: temperature, humidity |
 | `sht30_proto.c` | SHT30 protocol (CRC, conversion, sequencing) — pure C, host-tested |
 | `bme280_math.c` | BME280 calibration and compensation — pure C, host-tested |

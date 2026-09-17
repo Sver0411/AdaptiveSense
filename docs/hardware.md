@@ -45,7 +45,7 @@ the shared I²C bus; the chip-specific work is in a backend behind
 
 | `CONFIG_AS_SENSOR_BACKEND` | part | channels it provides | address macro |
 |---|---|---|---|
-| `1` | BME280 / BMP280 | temperature, humidity, **pressure** | `CONFIG_AS_BME280_I2C_ADDR` |
+| `1` | BME280 | temperature, humidity, **pressure** | `CONFIG_AS_BME280_I2C_ADDR` |
 | `2` (default) | SHT30 / SHT3x | temperature, humidity | `CONFIG_AS_SHT30_I2C_ADDR` |
 
 A backend marks the channels it cannot measure **invalid**, and the change detector

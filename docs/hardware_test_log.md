@@ -78,7 +78,7 @@ method and raw evidence are in the session notes below.
 | **GY-302 / BH1750** light sensor | I²C `0x23` | Accepts the BH1750 command set (power-on `0x01`, continuous H-resolution `0x10`) and returns 66 counts = 55.0 lx, a plausible indoor value | **No** — the light channel is documented as not implemented |
 | **0.96" OLED** | I²C `0x3C` | Reads back a constant `45 45 45 ...` for every register pointer: the signature of a write-only display controller | **No** — not part of the project |
 | **Capacitive soil moisture** | **GPIO1**, analogue output | Not visible to an I²C scan (confirmed by the owner). The electrical diagnostic found GPIO1 held high against the internal pull-down (`up=1 dn=1`), which is what an analogue output sitting near 3.3 V looks like — i.e. the method detected it without being told | **No** — not part of the project |
-| **BME280 / BMP280** | — | **Not found on any pin pair tested** | **This is what the firmware needs** |
+| **BME280** | — | **Not found on any pin pair tested** | **This is what the firmware needs.** A BMP280 would not do: no humidity channel, and the driver rejects its chip id |
 
 The four I²C modules all sit on **GPIO8 (SDA) / GPIO9 (SCL)**. The project uses
 **GPIO4 / GPIO5**, which the electrical diagnostic reports as floating — there is
@@ -94,7 +94,7 @@ nothing on the project's bus.
 ### Wiring required for this project
 
 See [`hardware.md`](hardware.md#wiring) for the authoritative table (pins,
-voltage, cautions, pins to avoid). Summary: a BME280 or BMP280 breakout on
+voltage, cautions, pins to avoid). Summary: a BME280 breakout on
 **SDA = GPIO4, SCL = GPIO5, VCC = 3.3 V, GND = GND, ADDR/SDO = GND** (→ address
 `0x76`). Do **not** feed 5 V into SDA/SCL.
 
@@ -157,7 +157,7 @@ GY-302 (BH1750), an OLED and a capacitive soil sensor — no BME280.
 
 The sensor layer became **sensor-agnostic**: `sensor.c` keeps the API, the read
 contract and the choice of backend; chip drivers implement `sensor_backend.h`.
-Two backends ship (BME280/BMP280 and SHT30/SHT3x), the bus is owned once by
+Two backends ship (BME280 and SHT30/SHT3x), the bus is owned once by
 `sensor_bus.c` and shared, and the SHT30 protocol (CRC, conversion, sequencing) is
 a pure-C unit tested on the host.
 
@@ -579,7 +579,7 @@ is inferred.
 |---|---|
 | duration | **25.2 min** (device uptime 1511 s) |
 | total cycles / successful samples | **89 / 89** |
-| read failures | 59 (all inside the injected sensor fault, §2) |
+| read failures | **3** reads attempted and failed, all inside the injected sensor fault (§2) |
 | Wi-Fi connect / disconnect | 1 / **0** |
 | MQTT connect / disconnect / reconnects | 1 / 1 (the boot-time pre-association attempt) / **0** |
 | `upload_requested` / `publish_call_ok` | 36 / **35** |
@@ -595,6 +595,11 @@ is inferred.
 The 60 s heartbeat and the 120 s keepalive both ran for the whole window: the
 collector's rows are 60 s apart in the settled phase, and the broker log shows
 `k120` with PINGREQ/PINGRESP exchanges.
+
+> **Corrected in session 6.** This row read *59 read failures* when it was first
+> written. Only **3** reads were ever attempted; the counter was being inflated by
+> the accounting defect fixed in session 6 §1, which counted every cycle spent
+> waiting for a re-probe as another failed read. The corrected number is above.
 
 > **Not measured:** heap usage. The firmware does not log free heap, so "no memory
 > leak" cannot be claimed — only "no crash, no reboot, and the light-sleep counters
@@ -642,8 +647,11 @@ whole sensor module for about five minutes:
 * the state name is now honest at every step;
 * bring-up became reachable again and was attempted **29 times**, rate-limited;
 * recovery went through an actual **re-probe**, not a lucky stale handle;
-* the detector saw nothing during the outage: cycles jump from **6 to 66**, so
-  cycles 7–65 (59 failures) never reached it.
+* the detector saw nothing during the outage: cycles jump from **6 to 66**, so the
+  reading cycles in between never reached it. **3** reads were actually attempted
+  and failed; the other cycles attempted nothing. The *59 failures* this line used
+  to quote came from the counting defect corrected in session 6 (§1) — it counted
+  every waiting cycle as a failed read.
 
 **Two behaviours worth recording, neither a defect:**
 
@@ -762,6 +770,198 @@ Recorded because they cost time and would cost anyone else the same:
 * **MQTT TLS or authentication** — the broker ran anonymous.
 * **Heap usage over time** — no heap logging exists.
 * **Energy** — no current measurement was taken.
+
+---
+
+## Session 6 — 2026-09-18, cleanup: accounting, sensor state, and what the docs claim
+
+A narrow cleanup pass. No new features, and no algorithm changes: the change
+detector, the adaptive scheduler, the interval ladder, the event threshold, the
+upload policy and the simulator are untouched (`git diff` over those paths is
+empty). What follows is four corrections and the hardware evidence for them.
+
+### §1 Read-failure accounting — FIXED AND RETESTED
+
+**The defect.** `main.c` combined readiness with the read result in one condition:
+
+```c
+if (!sensor_sup_ready(&sensor_sup) || sensor_read(&reading) != 0) {
+    sensor_sup_note_read_failure(&sensor_sup, t_sample);
+```
+
+Short-circuit evaluation means the second operand is never evaluated once the first
+is true. So a cycle in which the sensor was already unavailable — **no read was
+attempted at all** — still incremented both failure counters. Every cycle spent
+waiting for a re-probe added one more.
+
+That is where session 5's *59 read failures* came from. Three reads were attempted;
+the other 56 waiting cycles were counted anyway. The number in §1 and §2 of that
+session has been corrected above.
+
+**The fix** is a separation the defect had merged, in `main.c`:
+
+```
+1. not ready    → no read happens, and nothing is counted; wait for re-probe
+2. attempted → failed → this is the only case that counts a failure
+3. succeeded    → resets the consecutive-failure streak
+```
+
+Only case 2 touches the counters. The two counters also now say what they mean at
+every step: case 2 prints `N consecutive, M in total`, case 1 prints the running
+total, which is the line where the freezing is visible.
+
+**Tests.** A new `cycles` subcommand in `tests/c_host/sensor_host_main.c` replays
+main.c's order — bring-up first, then the three-way read — one cycle at a time, so
+the assertions are made against the loop's behaviour rather than a description of
+it. Eight new tests in `tests/test_sensor_supervisor.py` cover: a healthy sensor
+counts nothing; the counter equals the number of reads actually attempted; the
+threshold is what ends the failures; **the waiting cycles do not move it**; no read
+is attempted while the sensor is known to be down; re-probes are attempted and
+rate-limited; recovery clears the streak; and the total is a record of the outage
+rather than live state, so recovery does not erase it.
+
+The tests were checked against the old behaviour, not just the new one: with the
+short-circuit form restored in the driver, 5 of them fail; with the fix, 22 pass.
+`scripts/check_config_parity.py` also gained a structural rule that refuses the
+`!sensor_sup_ready(...) || sensor_read(...)` shape in `main.c` outright, alongside
+the existing `power_mgmt.c` rules, so the pattern cannot come back unnoticed.
+
+**Hardware.** Flashed, then captured through one continuous session. The SHT30
+module was pulled at device uptime ≈117 s and left out for ~3 minutes:
+
+```
+[121118ms] W sensor read failed at cycle 5 (ready (reads failing)); 1 consecutive, 1 in total
+[126119ms] W sensor read failed at cycle 6 (ready (reads failing)); 2 consecutive, 2 in total
+[131120ms] E sensor became unavailable after 3 consecutive read failures (3 in total); will re-probe
+[131120ms] W sensor read failed at cycle 7 (unavailable (will retry)); 3 consecutive, 3 in total
+[136179ms] W sensor init failed (2 attempt(s)); retrying no sooner than 5s from now
+[136180ms] W no reading at cycle 8 (sensor unavailable (will retry)); 3 read failure(s) on record, waiting for re-probe in 5s
+...
+[281137ms] W no reading at cycle 37 (sensor unavailable (will retry)); 3 read failure(s) on record, waiting for re-probe in 5s
+```
+
+| | |
+|---|---|
+| read failures | **3** — cycles 5, 6, 7, each a read that was genuinely attempted |
+| unavailability events | **1**, at the third failure |
+| waiting cycles with no read attempted | **30** (cycles 8–37), spanning **145 s** |
+| distinct `read_failures_total` values across those 30 cycles | **{3}** |
+| what the old counting would have produced | 3 + 30 = **33** |
+
+The module was plugged back in and the node recovered on its own:
+
+```
+[286168ms] I sensor initialised after 17 attempt(s)          re-probe succeeded
+cyc=38..68  T=28.41→26.99  RH=56.72→59.45  continuous reads resumed
+```
+
+15 failed re-probe attempts preceded it, spaced 9.9–10.0 s apart (bounded, the
+same ~10 s cadence session 5 recorded and explained). 0 panics, 0 watchdog, 0
+reboots across the whole window. Nothing was restarted by hand; the capture was
+started once, at the beginning, and ran through both injections.
+
+### §2 `sensor.c` internal state — FIXED AND RETESTED
+
+**The defect.** `sensor_init()` could fail *after* an earlier success. On that path
+it returned `-1` without clearing `s_sensor_initialized`, so the state left behind
+was
+
+```
+sensor_is_initialized() == true        active backend == NULL
+```
+
+— the flag said usable while the backend had already been torn down. A caller that
+trusts `sensor_is_initialized()` would read through a handle that no longer existed.
+
+**The fix.** A bring-up attempt now begins by declaring the sensor unusable and only
+the success path at the bottom puts it back, which maintains
+
+```
+s_sensor_initialized == (s_active != NULL)
+```
+
+on every path, including the two early returns (no backend selected, bus
+unavailable).
+
+**Tests.** The mock build now exposes `sensor_mock_stats_t`, whose `backend_live`
+stands in for a real build's `s_active != NULL`, so the two halves of the invariant
+can be compared rather than assumed. Six new tests in `tests/test_sensor_contract.py`:
+first init succeeds; **a failed re-init reports itself uninitialised**; no stale
+handle survives it; a read after a failed re-init is refused *and the refusal never
+reaches a backend*; recovery follows a later successful init; every attempt is
+counted. Checked against the old behaviour: 3 of them fail with the previous code
+and pass with the fix — including the one that shows the refused read reaching a
+backend, which is the stale-handle defect observed rather than argued.
+
+On hardware the invariant is visible in the log as the absence of its violation:
+`initialised after 17 attempt(s)` appears exactly once, only when bring-up
+succeeded, and no read was attempted during the 30 waiting cycles. There is no
+hardware-visible `initialized=true / active=NULL` state, and no read was served from
+a torn-down backend.
+
+### §3 `BMP280` support claim — CORRECTED
+
+The driver is a **BME280** backend and only that. It checks `BME280_CHIP_ID = 0x60`,
+reads the humidity calibration and humidity registers, and outputs humidity. A
+BMP280 reports chip id `0x58`, has no humidity channel at all, and is **rejected by
+the chip-id check** — so "supports BMP280" was not merely unsupported, it
+contradicted the code.
+
+Every `BME280 / BMP280` and "supports BMP280" claim in `README.md`, `README_zh.md`,
+`docs/architecture.md`, `docs/hardware.md`, `docs/hardware_test_log.md`,
+`firmware/main/config.example.h`, `sensor.c`, `sensor.h`, `sensor_backend.h` and
+`sensor_bme280.c` was changed to `BME280`. No BMP280 driver was added — the goal was
+to stop overstating, not to add support.
+
+Three `BMP280` mentions remain on purpose, and all three explain that it is a
+*different* part that this backend will refuse. `sensor_bme280.c` now states it
+directly:
+
+```c
+ * BME280 only. A BMP280 is a different part: it reports chip id 0x58 instead of
+ * 0x60, has no humidity registers, and is therefore rejected by the chip-id check
+ * below rather than silently mis-driven.
+```
+
+### §4 Stale BME280-only descriptions in README and main.c — CORRECTED
+
+The default backend on this build is the SHT30 and the sensor layer has been
+sensor-agnostic for some time, but the architecture description still read as if the
+BME280 were the one sensor. Fixed:
+
+* `README.md` / `README_zh.md`: the flow is now `WAKE → READ SENSOR → SCORE CHANGE
+  → ADAPTIVE POLICY → PUBLISH → IDLE`, with the sensor layer shown as an abstraction
+  over two backends (SHT30/SHT3x, and BME280 as the optional one), and the physical
+  build identified as ESP32-S3 + SHT30.
+* the Mermaid diagram nodes no longer say `sensor.c: BME280 I2C, forced mode`; they
+  say `sensor abstraction / SHT30 / BME280 / shared I2C bus`.
+* `main.c`'s loop comment no longer says `READ SENSOR (forced-mode BME280
+  conversion)`. The BME280's forced-mode sequence is documented in
+  `sensor_bme280.c`, which is where a chip-specific detail belongs — not in the main
+  loop's outline.
+
+### Verification for this session
+
+```
+pytest:          181 passed (was 167; +8 accounting, +6 contract)
+config parity:   60/60 PASS (was 56; +4 structural rules on main.c)
+ESP-IDF build:   clean build from scratch, rc=0
+warnings:        0 warnings, 0 errors, image 903,984 B (0xdcb30)
+simulation:      unchanged; analysis/ runs to completion
+core algorithm:  change_detector / adaptive_scheduler / simulator / analysis —
+                 zero diff
+```
+
+### Not tested in this session, and one recorded-but-not-fixed boundary
+
+* **`scheduler requests an upload` ≠ `MQTT delivered it`.** The first sample after
+  boot is still lost because the node samples before Wi-Fi associates; it is counted
+  as a failed publish rather than hidden. That is a known boundary of the design and
+  it was **not** changed here, on purpose.
+* no BH1750, OLED, soil, SNTP, pending-publish buffering, or Wi-Fi reconnect
+  backoff — out of scope for this pass.
+* heap usage still unmeasured (no heap logging), so "no leak" is still not claimed,
+  only "no crash and no reboot".
 
 ---
 

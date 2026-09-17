@@ -7,7 +7,7 @@
  *
  * Two backends ship today:
  *
- *   sensor_backend_bme280   BME280 / BMP280, register-level, includes pressure
+ *   sensor_backend_bme280   BME280, register-level, includes pressure
  *   sensor_backend_sht30    SHT30 / SHT3x, command-based, temperature + humidity
  *
  * Adding a third means adding one file plus an entry in the selection switch in

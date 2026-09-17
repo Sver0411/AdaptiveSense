@@ -1,5 +1,10 @@
 /*
- * sensor_bme280.c — BME280 / BMP280 backend.
+ * sensor_bme280.c — BME280 backend.
+ *
+ * BME280 only. A BMP280 is a different part: it reports chip id 0x58 instead of
+ * 0x60, has no humidity registers, and is therefore rejected by the chip-id check
+ * below rather than silently mis-driven. Do not describe this backend as
+ * supporting BMP280 — it does not, and it will refuse one.
  *
  * Register-level driver: calibration parsing and the compensation equations live
  * in bme280_math.c (pure C, host-tested), and this file owns the transport and the

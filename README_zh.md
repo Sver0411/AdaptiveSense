@@ -42,7 +42,7 @@
 ```mermaid
 flowchart LR
     subgraph Node["ESP32-S3 节点 (firmware/)"]
-        SEN["sensor.c: BME280 I2C<br/>forced 模式"] --> CD["change_detector.c<br/>分数 + 去抖事件"]
+        SEN["传感器抽象层<br/>SHT30 / BME280<br/>共享 I²C 总线"] --> CD["change_detector.c<br/>分数 + 去抖事件"]
         CD --> AS["adaptive_scheduler.c<br/>状态 / 间隔 / 上传"]
         AS --> COMM["communication.c<br/>Wi-Fi + MQTT"]
         AS --> PM["power_mgmt.c<br/>ESP-IDF 自动 light sleep"]
@@ -110,7 +110,7 @@ flowchart LR
   应用层**从不**调用 `esp_light_sleep_start()`。详见
   [docs/power_management.md](docs/power_management.md)。
 - **AdaptiveSense 是 sensor-agnostic（传感器无关）的**：传感层在同一接口与同一条共享
-  I²C 总线之后支持两种后端，由配置选择：**BME280/BMP280**（温度、湿度、**气压**）与
+  I²C 总线之后支持两种后端，由配置选择：**BME280**（温度、湿度、**气压**）与
   **SHT30/SHT3x**（温度、湿度）。传感层以上——变化检测、调度器、事件逻辑、仿真器——
   都不知道当前用的是哪一个，因为后端会把无法测量的通道标记为**无效**，
   而检测器本来就会忽略无效通道。本次真机验证使用 SHT30；

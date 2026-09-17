@@ -237,3 +237,153 @@ def test_threshold_zero_reproduces_the_old_behaviour(sensor_host):
     assert steps["fail-20"]["events"] == 0
     assert totals["unavailability_events"] == 0
     assert totals["read_failures"] == 20
+
+
+# ---------------------------------------------------------------------- #
+# the counters must only move for a read that was actually attempted
+#
+# The defect this pins down, found by review of main.c: one condition combined
+# readiness with the read result,
+#
+#     if (!sensor_sup_ready(&s) || sensor_read(&r) != 0) {
+#         sensor_sup_note_read_failure(&s, t);
+#
+# so with short-circuit evaluation "the sensor is unavailable, therefore no read
+# was attempted" was recorded as "a read failed". Every cycle spent waiting for a
+# re-probe moved the counters again: a hardware run reported 59 read failures
+# where 3 reads had actually been attempted.
+#
+# The host driver's `cycles` subcommand replays main.c's order (bring-up, then the
+# three-way read) so these assertions are made against the loop's behaviour rather
+# than against a description of it.
+# ---------------------------------------------------------------------- #
+def cycles_trace(sensor_host, *, retry=5, threshold=3, n_cycles=20,
+                 unplug_at=1, plug_back_at=12):
+    """Replay the sampling loop and return (rows by cycle number, totals)."""
+    output = run(sensor_host, "cycles", str(retry), str(threshold),
+                 str(n_cycles), str(unplug_at), str(plug_back_at))
+    rows = {}
+    totals = {}
+    for line in output.strip().splitlines():
+        parts = line.split(",")
+        if parts[0] == "cycle":
+            rows[int(parts[1])] = {
+                "t": float(parts[2]),
+                "init": parts[3],           # - | ok | fail
+                "read": parts[4],           # - | ok | fail
+                "total": int(parts[5]),
+                "consecutive": int(parts[6]),
+                "ready": int(parts[7]),
+            }
+        elif parts[0] == "totals":
+            totals = {
+                "init_attempts": int(parts[1]),
+                "init_failures": int(parts[2]),
+                "read_failures": int(parts[3]),
+                "read_successes": int(parts[4]),
+                "unavailability_events": int(parts[5]),
+            }
+    assert rows and totals, output
+    return rows, totals
+
+
+def test_a_healthy_sensor_reads_without_any_failure(sensor_host):
+    rows, totals = cycles_trace(sensor_host, n_cycles=5,
+                                unplug_at=999, plug_back_at=999)
+    assert all(r["read"] == "ok" for r in rows.values())
+    assert all(r["total"] == 0 for r in rows.values())
+    assert totals["read_failures"] == 0
+    assert totals["read_successes"] == 5
+
+
+def test_only_an_attempted_read_counts_as_a_failure(sensor_host):
+    """The invariant the defect violated: the counter equals the number of reads
+    that were actually tried and failed - not the number of cycles that passed."""
+    rows, totals = cycles_trace(sensor_host)
+    attempted_failures = sum(1 for r in rows.values() if r["read"] == "fail")
+    assert totals["read_failures"] == attempted_failures
+    assert attempted_failures == 3, "one per cycle the sensor was reachable and dead"
+    assert totals["read_failures"] < len(rows), (
+        "the counter grew past the number of reads that were attempted, which is "
+        "what the short-circuit defect produced"
+    )
+
+
+def test_the_threshold_ends_the_failures(sensor_host):
+    rows, totals = cycles_trace(sensor_host)
+    assert rows[1]["consecutive"] == 1
+    assert rows[2]["consecutive"] == 2
+    assert rows[3]["consecutive"] == 3
+    assert rows[3]["ready"] == 0, "the third failure is the one that drops it out"
+    assert totals["unavailability_events"] == 1
+
+
+def test_waiting_for_a_re_probe_does_not_move_the_counters(sensor_host):
+    """The specific regression: cycles with no read must leave the counters alone."""
+    rows, totals = cycles_trace(sensor_host)
+    waiting = {i: r for i, r in rows.items()
+               if r["ready"] == 0 and r["read"] == "-" and i < 14}
+    assert len(waiting) >= 8, waiting
+    frozen_total = {r["total"] for r in waiting.values()}
+    frozen_consec = {r["consecutive"] for r in waiting.values()}
+    assert frozen_total == {3}, f"read_failures_total moved while waiting: {frozen_total}"
+    assert frozen_consec == {3}, (
+        f"read_failures_consecutive moved while waiting: {frozen_consec}"
+    )
+    assert totals["read_failures"] == 3
+
+
+def test_no_read_is_attempted_while_the_sensor_is_unavailable(sensor_host):
+    """Reads stop at the drop-out and resume only after a successful bring-up.
+
+    The cycle that *causes* the drop-out is not a violation: the sensor was still
+    considered usable when that cycle began, so the read was legitimate and it is
+    the failure that changed the state. What must not happen is a read in a cycle
+    that began with the sensor already declared unavailable - and the one way back
+    is a bring-up that succeeds, which is exactly main.c's order.
+    """
+    rows, _ = cycles_trace(sensor_host)
+    recovery = min(i for i, r in rows.items() if r["init"] == "ok")
+    attempted = [i for i, r in rows.items() if r["read"] != "-"]
+    assert attempted == [1, 2, 3] + list(range(recovery, len(rows) + 1)), attempted
+
+    down = False
+    for i, r in sorted(rows.items()):
+        if down and r["init"] != "ok":
+            assert r["read"] == "-", f"cycle {i} read a sensor already known to be down"
+        down = (r["ready"] == 0)
+
+
+def test_re_probes_are_attempted_while_unavailable_and_rate_limited(sensor_host):
+    rows, totals = cycles_trace(sensor_host)
+    assert rows[4]["init"] == "fail", "bring-up must be reachable again"
+    assert rows[5]["init"] == "-", "and rate-limited, not spun"
+    assert rows[9]["init"] == "fail", "the next attempt comes one interval later"
+    assert totals["init_failures"] == 2
+    assert totals["init_attempts"] == 4, "the initial success plus three re-probes"
+
+
+def test_recovery_clears_the_streak_and_reads_resume(sensor_host):
+    rows, _ = cycles_trace(sensor_host)
+    assert rows[14]["init"] == "ok", "the part came back"
+    assert rows[14]["ready"] == 1
+    assert rows[14]["consecutive"] == 0, "a fresh bring-up means a fresh device"
+    assert rows[14]["read"] == "ok"
+    assert all(rows[i]["read"] == "ok" for i in range(14, 21))
+    # The historical total is kept: it is a record of the outage, not a claim
+    # about the present, so it is not reset by recovery.
+    assert rows[20]["total"] == 3
+
+
+def test_the_total_records_the_outage_but_the_streak_recovers(sensor_host):
+    """The two counters mean different things, and the difference is deliberate.
+
+    `read_failures_total` is a record of what happened, so recovery does not erase
+    it; `read_failures_consecutive` describes the present, so it goes back to zero.
+    A build that reset the total would hide the outage from the log;
+    """
+    rows, totals = cycles_trace(sensor_host)
+    assert rows[1]["total"] == 1, "it starts with the first read that was tried"
+    assert rows[20]["total"] == 3 == totals["read_failures"]
+    assert rows[20]["consecutive"] == 0
+    assert rows[20]["ready"] == 1

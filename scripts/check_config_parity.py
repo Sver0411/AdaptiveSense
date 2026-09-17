@@ -36,6 +36,7 @@ YAML_PATH = ROOT / "experiments" / "experiment_config.yaml"
 CONFIG_H = ROOT / "firmware" / "main" / "config.example.h"
 POLICY_CONFIG_C = ROOT / "firmware" / "main" / "policy_config.c"
 DETECTOR_H = ROOT / "firmware" / "main" / "change_detector.h"
+MAIN_C = ROOT / "firmware" / "main" / "main.c"
 POWER_MGMT_C = ROOT / "firmware" / "main" / "power_mgmt.c"
 SENSOR_C = ROOT / "firmware" / "main" / "sensor.c"
 SENSOR_BUS_C = ROOT / "firmware" / "main" / "sensor_bus.c"
@@ -248,6 +249,58 @@ def structural_checks() -> List[Tuple[str, bool, str]]:
             not managed_mqtt,
             "two mechanisms for one component" if managed_mqtt else "ok",
         ))
+
+    # --- the sampling loop must not conflate "no read" with "read failed" -----
+    #
+    # A short-circuit guard used to combine readiness with the read result:
+    #
+    #     if (!sensor_sup_ready(&s) || sensor_read(&r) != 0) {
+    #         sensor_sup_note_read_failure(&s, t);
+    #
+    # so a cycle that skipped the read because the sensor was unavailable was
+    # counted as a failed read, and the failure counters grew once per cycle for
+    # the whole outage (reported as 59 failures where 3 reads were attempted).
+    # The loop now keeps the three outcomes distinct; this keeps them distinct.
+    #
+    # Comments are stripped first: the explanation of the defect quotes the very
+    # pattern the check forbids.
+    main_c = strip_c_comments(MAIN_C.read_text(encoding="utf-8"))
+
+    conflated = re.search(r"!sensor_sup_ready\s*\([^)]*\)\s*\|\|", main_c) is not None
+    results.append((
+        "main.c does not short-circuit readiness into the read result",
+        not conflated,
+        "a skipped read would be counted as a failed one" if conflated else "ok",
+    ))
+
+    failure_sites = list(re.finditer(r"sensor_sup_note_read_failure\s*\(", main_c))
+    single_site = len(failure_sites) == 1
+    results.append((
+        "main.c counts a read failure from exactly one place",
+        single_site,
+        f"{len(failure_sites)} call sites" if not single_site else "ok",
+    ))
+
+    guarded = False
+    if single_site:
+        idx = failure_sites[0].start()
+        last_read = main_c.rfind("sensor_read(", 0, idx)
+        between = main_c[last_read:idx] if last_read != -1 else ""
+        guarded = last_read != -1 and "!= 0" in between
+    results.append((
+        "the counted failure sits inside 'if (sensor_read(...) != 0)'",
+        guarded,
+        "ok" if guarded else "a read failure is recorded without a read attempt",
+    ))
+
+    success_sites = list(re.finditer(r"sensor_sup_note_read_success\s*\(", main_c))
+    ordered = (single_site and len(success_sites) == 1
+               and success_sites[0].start() > failure_sites[0].start())
+    results.append((
+        "main.c resets the streak only after the failure branch",
+        ordered,
+        "ok" if ordered else "the success path is missing or misordered",
+    ))
 
     sleep_ok = "esp_wifi_stop" not in (
         ROOT / "firmware" / "main" / "power_mgmt.c"

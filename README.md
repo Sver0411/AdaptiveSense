@@ -40,15 +40,23 @@ measures how much that buys, and where it fails.
 ## System
 
 ```
-WAKE → READ BME280 (one forced-mode conversion) → SCORE CHANGE
+WAKE → READ SENSOR (through the sensor abstraction) → SCORE CHANGE
      → ADAPTIVE POLICY (state, next interval, upload decision)
      → PUBLISH over MQTT if requested → IDLE until the next sample
+
+The sensor layer is an abstraction with two backends behind it:
+
+```
+sensor abstraction  (sensor.c: API, read contract, shared I2C bus)
+├── SHT30 / SHT3x     temperature + humidity      <- this physical build
+└── BME280            temperature + humidity + pressure
+```
 ```
 
 ```mermaid
 flowchart LR
     subgraph Node["ESP32-S3 node (firmware/)"]
-        SEN["sensor.c: BME280 I2C,<br/>forced mode"] --> CD["change_detector.c<br/>score + debounced event"]
+        SEN["sensor abstraction<br/>SHT30 / BME280<br/>shared I2C bus"] --> CD["change_detector.c<br/>score + debounced event"]
         CD --> AS["adaptive_scheduler.c<br/>state / interval / upload"]
         AS --> COMM["communication.c<br/>Wi-Fi + MQTT"]
         AS --> PM["power_mgmt.c<br/>ESP-IDF automatic light sleep"]
@@ -128,7 +136,7 @@ tuning value is hardcoded in any source file.
   [docs/power_management.md](docs/power_management.md).
 - **AdaptiveSense is sensor-agnostic.** The sensor layer supports two backends
   behind one interface and one shared I2C bus, selected by configuration: a
-  **BME280/BMP280** (temperature, humidity, **pressure**) and an **SHT30/SHT3x**
+  **BME280** (temperature, humidity, **pressure**) and an **SHT30/SHT3x**
   (temperature, humidity). Nothing above the sensor layer — change detector,
   scheduler, event logic, simulator — knows which is in use, because a backend
   reports the channels it cannot measure as *invalid* and the detector already

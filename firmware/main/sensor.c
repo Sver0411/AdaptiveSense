@@ -9,7 +9,7 @@
  *   * the mock override used when no hardware is attached.
  *
  * and delegates the actual work to a `sensor_backend_t`. Two backends ship:
- * BME280/BMP280 (register-level, with pressure) and SHT30/SHT3x (command-based,
+ * BME280 (register-level, with pressure) and SHT30/SHT3x (command-based,
  * temperature and humidity). See sensor_backend.h.
  *
  * Backends report what they cannot measure by leaving the channel invalid, which
@@ -47,8 +47,43 @@
 
 static const char *TAG = "sensor";
 
-/* Set to true only by a sensor_init() that actually succeeded. */
+/* Set to true only by a sensor_init() that actually succeeded. Invariant:
+ * `s_sensor_initialized == (s_active != NULL)` in non-mock builds. */
 static bool s_sensor_initialized = false;
+
+#if CONFIG_AS_USE_MOCK_SENSOR
+/* Test seam, present only in the mock configuration: make the next init fail so
+ * the contract's failure path can be exercised without an ESP32 attached. */
+static bool s_mock_init_fails = false;
+
+/*
+ * Stand-ins for the state a real build keeps in `s_active`. A device build's
+ * invariant is `s_sensor_initialized == (s_active != NULL)`; `s_mock_backend_live`
+ * is the second half of that pair here, so a host test can assert the invariant
+ * instead of taking it on trust — in particular that a *failed* re-init leaves no
+ * handle behind for a later read to use.
+ */
+static bool s_mock_backend_live = false;
+static unsigned s_mock_init_calls = 0;
+static unsigned s_mock_init_failures = 0;
+static unsigned s_mock_read_calls = 0;
+
+void sensor_mock_set_init_failure(bool should_fail)
+{
+    s_mock_init_fails = should_fail;
+}
+
+void sensor_mock_stats(sensor_mock_stats_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    out->init_calls = s_mock_init_calls;
+    out->init_failures = s_mock_init_failures;
+    out->read_calls = s_mock_read_calls;
+    out->backend_live = s_mock_backend_live;
+}
+#endif
 
 #if !CONFIG_AS_USE_MOCK_SENSOR
 /* The backend that is currently brought up, or NULL. */
@@ -97,11 +132,40 @@ static void mock_fill(sensor_read_t *out)
 int sensor_init(void)
 {
 #if CONFIG_AS_USE_MOCK_SENSOR
+    s_mock_init_calls++;
+    if (s_mock_init_fails) {
+        /* Mock-only seam so the contract's failure path is testable on a host.
+         * Not compiled into a device build; see sensor.h. */
+        ESP_LOGW(TAG, "MOCK sensor: init failure requested by the test seam");
+        s_sensor_initialized = false;
+        s_mock_backend_live = false; /* the equivalent of teardown() in a real build */
+        s_mock_init_failures++;
+        return -1;
+    }
     ESP_LOGW(TAG, "MOCK sensor enabled - results are NOT real measurements");
     s_sensor_initialized = true;
+    s_mock_backend_live = true;
     return 0;
 #else
     const sensor_backend_t *backend = selected_backend();
+
+    /*
+     * A bring-up attempt begins by declaring the sensor unusable, and only the
+     * success path at the bottom puts it back. The invariant this maintains is
+     *
+     *     s_sensor_initialized == (s_active != NULL)
+     *
+     * which matters because a *re*-init can fail. Before this, that left the
+     * previous success's flag set while the backend had already been torn down:
+     * `sensor_is_initialized()` returned true with no active backend, and callers
+     * that trust it would talk to a driver that no longer exists.
+     */
+    s_sensor_initialized = false;
+    if (s_active != NULL) {
+        s_active->teardown();
+        s_active = NULL;
+    }
+
     if (backend == NULL) {
         return -1;
     }
@@ -113,15 +177,9 @@ int sensor_init(void)
         return -1;
     }
 
-    /* Release whatever the previous attempt left behind before trying again. */
-    if (s_active != NULL) {
-        s_active->teardown();
-        s_active = NULL;
-    }
-
     if (backend->init() != 0) {
         backend->teardown();
-        return -1;
+        return -1; /* already not initialized, and no active backend */
     }
 
     s_active = backend;
@@ -145,6 +203,9 @@ int sensor_read(sensor_read_t *out)
     memset(out, 0, sizeof(*out));
 
 #if CONFIG_AS_USE_MOCK_SENSOR
+    /* Counted here, i.e. only once the contract has allowed the read, so the
+     * counter shows whether a rejected call ever reached a backend. */
+    s_mock_read_calls++;
     mock_fill(out);
     return 0;
 #else

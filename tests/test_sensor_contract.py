@@ -93,3 +93,94 @@ def test_two_reads_differ(sensor_host):
     read = parse_key_values(output.strip().splitlines()[1])
     assert float(read["temp"]) != 0.0
     assert float(read["hum"]) != 0.0
+
+
+# ---------------------------------------------------------------------- #
+# a failed *re*-init must not leave the subsystem half-alive
+#
+# Found while cleaning up the read accounting: `sensor_init()` returned early on
+# a backend failure without clearing the flag set by the previous success, so a
+# re-init that failed left
+#
+#     sensor_is_initialized() == true     with     active backend == NULL
+#
+# and a caller that trusts the flag would read through a handle that had already
+# been torn down. The mock build exposes `live` — the stand-in for a real build's
+# `s_active != NULL` — so the two halves of the invariant can be compared instead
+# of assumed.
+# ---------------------------------------------------------------------- #
+def contract_steps(sensor_host):
+    """Run the failed-re-init sequence and return {label: parsed}.
+
+    Each step reports rc=, is_init=, live=, init_calls= and reads=.
+    """
+    steps = {}
+    for line in run(sensor_host, "contract-init-fail").strip().splitlines():
+        parts = line.split(",")
+        assert parts[0] == "step", line
+        fields = dict(p.split("=", 1) for p in parts[2:])
+        fields["rc"] = int(fields["rc"])
+        steps[parts[1]] = fields
+    assert set(steps) == {
+        "first_init", "first_read", "second_init", "second_read",
+        "third_init", "third_read",
+    }, steps
+    return steps
+
+
+def test_first_init_succeeds_and_reads(sensor_host):
+    steps = contract_steps(sensor_host)
+    assert steps["first_init"]["rc"] == 0
+    assert steps["first_init"]["is_init"] == "1"
+    assert steps["first_init"]["live"] == "1"
+    assert steps["first_read"]["rc"] == 0
+    assert steps["first_read"]["live"] == "1"
+
+
+def test_a_failed_re_init_reports_itself_as_uninitialised(sensor_host):
+    """The defect: this used to stay is_init=1 after a failed bring-up."""
+    steps = contract_steps(sensor_host)
+    assert steps["second_init"]["rc"] == -1, "the forced failure did not fail"
+    assert steps["second_init"]["is_init"] == "0", (
+        "sensor_init() failed but sensor_is_initialized() still says otherwise"
+    )
+
+
+def test_no_stale_backend_handle_survives_a_failed_re_init(sensor_host):
+    """`is_init` and `live` must agree; the bug was exactly their disagreement."""
+    steps = contract_steps(sensor_host)
+    assert steps["second_init"]["live"] == "0", (
+        "a failed re-init left a backend handle behind for a later read to use"
+    )
+    for label, step in steps.items():
+        assert step["is_init"] == step["live"], (
+            f"{label}: initialized={step['is_init']} but backend_live="
+            f"{step['live']} - the flag and the backend disagree"
+        )
+
+
+def test_a_read_is_refused_after_a_failed_re_init(sensor_host):
+    """Refused, and the refusal never reaches a backend."""
+    steps = contract_steps(sensor_host)
+    assert steps["second_read"]["rc"] == -1
+    assert steps["second_read"]["is_init"] == "0"
+    assert steps["second_read"]["reads"] == steps["first_read"]["reads"], (
+        "a refused read was still passed through to a backend"
+    )
+
+
+def test_recovery_follows_a_later_successful_re_init(sensor_host):
+    steps = contract_steps(sensor_host)
+    assert steps["third_init"]["rc"] == 0
+    assert steps["third_init"]["is_init"] == "1"
+    assert steps["third_init"]["live"] == "1"
+    assert steps["third_read"]["rc"] == 0
+    assert int(steps["third_read"]["reads"]) == int(steps["second_read"]["reads"]) + 1
+
+
+def test_every_attempt_is_counted(sensor_host):
+    """Three init calls were made, so three are reported."""
+    steps = contract_steps(sensor_host)
+    assert steps["first_init"]["init_calls"] == "1"
+    assert steps["second_init"]["init_calls"] == "2"
+    assert steps["third_init"]["init_calls"] == "3"

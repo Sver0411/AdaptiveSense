@@ -88,7 +88,7 @@
 /*
  * Which sensor backend to run.
  *
- *   1 = BME280 / BMP280   register-level, provides temperature, humidity and
+ *   1 = BME280            register-level, provides temperature, humidity and
  *                         pressure (the only backend with a pressure channel)
  *   2 = SHT30 / SHT3x     command-based, provides temperature and humidity
  *
@@ -102,7 +102,7 @@
 
 /* I2C address of each supported part. Only the selected backend's address is
  * used; the other is kept so switching back is a one-line change.
- *   BME280/BMP280: 0x76 (SDO to GND) or 0x77 (SDO to VCC)
+ *   BME280: 0x76 (SDO to GND) or 0x77 (SDO to VCC)
  *   SHT30/SHT3x:   0x44 (ADDR to GND) or 0x45 (ADDR to VCC) */
 #define CONFIG_AS_BME280_I2C_ADDR     0x76
 #define CONFIG_AS_SHT30_I2C_ADDR      0x44

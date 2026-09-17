@@ -5,7 +5,10 @@
  *
  *   IDLE until the scheduled sample time   (vTaskDelay; the ESP-IDF power manager
  *                                           may enter light sleep while idle)
- *   -> READ SENSOR            (forced-mode BME280 conversion)
+ *   -> READ SENSOR            (through the sensor abstraction; which chip is
+ *                              behind it is a configuration choice — the BME280
+ *                              backend's forced-mode sequence is documented in
+ *                              sensor_bme280.c, not here)
  *   -> EVALUATE CHANGE        (change_detector: score + debounced event)
  *   -> ADAPTIVE SCHEDULER     (state, next interval, upload decision)
  *   -> PUBLISH if requested   (and record whether the MQTT client took it)
@@ -154,10 +157,45 @@ void app_main(void)
             }
         }
 
-        /* ---- READ SENSOR ------------------------------------------------ */
+        /* ---- READ SENSOR ------------------------------------------------
+         *
+         * Three distinct outcomes, kept distinct on purpose. They used to be
+         * merged into one condition:
+         *
+         *     if (!sensor_sup_ready(...) || sensor_read(&reading) != 0) {
+         *         sensor_sup_note_read_failure(...);
+         *
+         * With short-circuit evaluation that counted "the sensor is unavailable,
+         * so no read was attempted" as "a read failed", and every cycle spent
+         * waiting for a re-probe inflated the failure counters. On hardware that
+         * reported 59 read failures where only 3 reads had actually been tried.
+         *
+         *   1. not ready        no read happens, and nothing is counted
+         *   2. read attempted and failed   the only case that counts a failure
+         *   3. read succeeded   resets the consecutive-failure streak
+         */
         power_set_phase(PM_SAMPLE);
         sensor_read_t reading;
-        if (!sensor_sup_ready(&sensor_sup) || sensor_read(&reading) != 0) {
+
+        if (!sensor_sup_ready(&sensor_sup)) {
+            /* Case 1: unusable, waiting for the next bring-up attempt.
+             *
+             * The totals are printed on every waiting cycle on purpose: they must
+             * not move here, and the only way to see that is to look. This line is
+             * where the old counting defect showed up — it used to increment both
+             * counters once per cycle for the whole outage. */
+            ESP_LOGW(TAG, "no reading at cycle %lu (sensor %s); %u read failure(s) "
+                          "on record, waiting for re-probe in %ds",
+                     cycle, sensor_sup_state_name(&sensor_sup),
+                     sensor_sup.read_failures_total,
+                     (int)CONFIG_AS_MIN_INTERVAL_S);
+            next_wake = t_sample + (double)CONFIG_AS_MIN_INTERVAL_S;
+            log_periodic_stats(cycle);
+            continue;
+        }
+
+        if (sensor_read(&reading) != 0) {
+            /* Case 2: a read was genuinely attempted and failed. */
             const bool became_unavailable =
                 sensor_sup_note_read_failure(&sensor_sup, t_sample);
             if (became_unavailable) {
@@ -166,18 +204,18 @@ void app_main(void)
                          sensor_sup.read_failures_consecutive,
                          sensor_sup.read_failures_total);
             }
-            ESP_LOGW(TAG, "no usable reading at cycle %lu (sensor %s); next "
-                          "attempt in %ds",
+            ESP_LOGW(TAG, "sensor read failed at cycle %lu (%s); %u consecutive, "
+                          "%u in total; next attempt in %ds",
                      cycle, sensor_sup_state_name(&sensor_sup),
+                     sensor_sup.read_failures_consecutive,
+                     sensor_sup.read_failures_total,
                      (int)CONFIG_AS_MIN_INTERVAL_S);
             next_wake = t_sample + (double)CONFIG_AS_MIN_INTERVAL_S;
-            /* Report the duty cycle here too. A node that cannot read its sensor
-             * is exactly the node whose sleep behaviour is worth seeing, and
-             * skipping it would leave the power-management state unobservable in
-             * the one case where it is most in question. */
             log_periodic_stats(cycle);
             continue;
         }
+
+        /* Case 3: a real measurement. */
         sensor_sup_note_read_success(&sensor_sup);
         memcpy(g_valid, reading.valid, sizeof(g_valid));
         for (int i = 0; i < CD_NUM_CHANNELS; i++) {
