@@ -13,6 +13,7 @@ from the same source the device runs.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -139,26 +140,47 @@ def test_overflow_is_reported_not_truncated(payload_host):
 # ---------------------------------------------------------------------- #
 # the configured payload size is measured, not guessed
 # ---------------------------------------------------------------------- #
-def test_configured_payload_size_matches_the_shipped_payload(payload_host):
-    """`payload_bytes_per_upload` must describe what the shipped build emits.
+def _configured_backend() -> int:
+    """Read CONFIG_AS_SENSOR_BACKEND from the committed configuration.
 
-    The shipped build implements a BME280 only, so the form it actually sends has
-    `"light":null` and `valid.light == false`. That is the form the configured
-    size has to match; `tests/c_host/payload_host_main.c` builds it from the same
-    source the device runs, so this is a measurement and not an estimate.
+    1 = BME280 (temperature, humidity, pressure), 2 = SHT30 (temperature,
+    humidity). A backend marks the channels it cannot measure invalid, and an
+    invalid channel is sent as `null`, so the payload length depends on this.
     """
+    text = (FIRMWARE_MAIN / "config.example.h").read_text(encoding="utf-8")
+    match = re.search(r"^#define\s+CONFIG_AS_SENSOR_BACKEND\s+(\d+)", text, flags=re.M)
+    assert match, "CONFIG_AS_SENSOR_BACKEND not found in config.example.h"
+    return int(match.group(1))
+
+
+def test_configured_payload_size_matches_the_shipped_payload(payload_host):
+    """`payload_bytes_per_upload` must describe what the configured build emits.
+
+    The expected channel-validity mask is derived from the same configuration the
+    firmware is built from, so switching the sensor backend cannot leave the size
+    constant describing the other one. `tests/c_host/payload_host_main.c` builds
+    the payload from the same source the device runs, so this is a measurement and
+    not an estimate.
+    """
+    backend = _configured_backend()
+    valid_mask = {
+        1: "1110",  # BME280: pressure is real, no light sensor in this build
+        2: "1100",  # SHT30: no pressure sensor either
+    }[backend]
+
     cfg = load_config()
     configured = int(cfg["adaptive"]["energy"]["payload_bytes_per_upload"])
 
     shipped = build(
         payload_host,
-        values=(24.10, 45.20, 1012.30, 0.0),
-        valid="1110",
+        values=(27.51, 56.47, 1012.30, 0.0),
+        valid=valid_mask,
         timestamp=1234567890,
     )
     assert len(shipped) == configured, (
-        f"configured payload_bytes_per_upload={configured} but the shipped payload "
-        f"is {len(shipped)} bytes; update the YAML to the measured size"
+        f"CONFIG_AS_SENSOR_BACKEND={backend} produces a {len(shipped)}-byte payload "
+        f"but payload_bytes_per_upload={configured}; update the YAML to the "
+        f"measured size"
     )
 
 

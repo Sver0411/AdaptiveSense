@@ -183,13 +183,14 @@ dead broker diagnosable.
 }
 ```
 
-Two details that carry meaning:
+That example is from an SHT30 build; a BME280 build reports a real `pressure`
+instead of `null`. Two details carry meaning:
 
-- **`null` for an unavailable channel.** The shipped build has no light sensor, so
-  `"light"` is `null` rather than `0`. A `0` would be indistinguishable from a
-  genuinely dark room.
+- **`null` for an unavailable channel.** An SHT30 has no pressure sensor and this
+  build has no light sensor, so both are `null` rather than `0`. A `0` would be
+  indistinguishable from a genuine reading of zero.
 - **The `valid` map is always present**, so a consumer never has to infer which
-  channels this build can actually measure.
+  channels the running configuration can actually measure.
 
 `tests/test_communication_payload.py` pins both, and re-measures the payload size
 that `payload_bytes_per_upload` claims.

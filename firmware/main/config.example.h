@@ -59,11 +59,11 @@
 #define CONFIG_AS_MQTT_KEEPALIVE_S 120  /* >= 2 x CONFIG_AS_MAX_INTERVAL_S */
 
 /* ------------------------------------------------------------------ */
-/* Sensor (BME280 over I2C) / mock                                     */
+/* Sensor (BME280 / SHT30 over I2C) / mock                             */
 /* ------------------------------------------------------------------ */
 /*
  * CONFIG_AS_USE_MOCK_SENSOR forces a deterministic fake sensor that mirrors
- * dataset/ so the firmware logic can be exercised without hardware. It is
+ * dataset/, so the firmware logic can be exercised without hardware. It is
  * guarded so a host-side test can override it on the compiler command line
  * (-DCONFIG_AS_USE_MOCK_SENSOR=1) and exercise the driver's public contract
  * without an ESP32 attached.
@@ -71,20 +71,49 @@
 #ifndef CONFIG_AS_USE_MOCK_SENSOR
 #define CONFIG_AS_USE_MOCK_SENSOR     0
 #endif
-#define CONFIG_AS_SENSOR_SDA_GPIO     4
-#define CONFIG_AS_SENSOR_SCL_GPIO     5
-#define CONFIG_AS_I2C_FREQ_HZ         400000
-#define CONFIG_AS_BME280_I2C_ADDR     0x76   /* or 0x77 */
 
-/* Forced-mode measurement timing (see firmware/main/sensor.c).
- * At oversampling x1/x1/x1 the datasheet's worst-case conversion time is well
- * under 20 ms; MEAS_SETTLE_MS lets the `measuring` status bit be asserted
- * before polling starts, and MEAS_TIMEOUT_MS is a hard upper bound on the
- * wait. The driver never blocks indefinitely. */
+/* I2C pins. These are a property of the board's wiring, not of any driver: the
+ * sensor backends read them from here, so moving a sensor to different pins is a
+ * configuration change and never a code change.
+ *
+ * The pins below match the development board this project is tested on, where the
+ * sensor modules sit on GPIO8/GPIO9. Pins to avoid on an ESP32-S3: 0/3/45/46
+ * (strapping), 19/20 (native USB), 26-32 (flash and the in-package octal PSRAM),
+ * 43/44 (console UART). See docs/hardware.md. */
+#define CONFIG_AS_SENSOR_SDA_GPIO     8
+#define CONFIG_AS_SENSOR_SCL_GPIO     9
+#define CONFIG_AS_I2C_FREQ_HZ         400000
+#define CONFIG_AS_I2C_TIMEOUT_MS      100
+
+/*
+ * Which sensor backend to run.
+ *
+ *   1 = BME280 / BMP280   register-level, provides temperature, humidity and
+ *                         pressure (the only backend with a pressure channel)
+ *   2 = SHT30 / SHT3x     command-based, provides temperature and humidity
+ *
+ * Both backends are always compiled, so neither can rot; the unselected one is
+ * dropped by the linker, so it costs no flash. Only this value selects between
+ * them. Everything above this line — the change detector, the scheduler,
+ * the event logic, the simulator — is unaffected by the choice, which is why the
+ * published simulation results remain valid either way.
+ */
+#define CONFIG_AS_SENSOR_BACKEND      2
+
+/* I2C address of each supported part. Only the selected backend's address is
+ * used; the other is kept so switching back is a one-line change.
+ *   BME280/BMP280: 0x76 (SDO to GND) or 0x77 (SDO to VCC)
+ *   SHT30/SHT3x:   0x44 (ADDR to GND) or 0x45 (ADDR to VCC) */
+#define CONFIG_AS_BME280_I2C_ADDR     0x76
+#define CONFIG_AS_SHT30_I2C_ADDR      0x44
+
+/* Forced-mode measurement timing for the BME280 backend (see
+ * firmware/main/sensor_bme280.c). At oversampling x1/x1/x1 the datasheet's
+ * worst-case conversion time is well under 20 ms; MEAS_SETTLE_MS lets the
+ * `measuring` status bit be asserted before polling starts, and MEAS_TIMEOUT_MS
+ * is a hard upper bound on the wait. The driver never blocks indefinitely. */
 #define CONFIG_AS_BME280_MEAS_SETTLE_MS  2
 #define CONFIG_AS_BME280_MEAS_TIMEOUT_MS 50
-/* Hard timeout for every I2C transaction. */
-#define CONFIG_AS_I2C_TIMEOUT_MS         100
 
 /* ------------------------------------------------------------------ */
 /* Adaptive sampling parameters (mirror experiments/experiment_config) */

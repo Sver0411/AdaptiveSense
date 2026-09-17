@@ -13,28 +13,54 @@
 
 ## Wiring
 
-### What this firmware actually needs
+### What this firmware needs
 
-One sensor: a **BME280 or BMP280** breakout on I²C. Everything else the firmware
-uses (Wi-Fi, flash, PSRAM) is on the module itself.
+One sensor on I²C. Everything else the firmware uses (Wi-Fi, flash, PSRAM) is on
+the module itself.
 
 | ESP32-S3 pin | sensor pin | voltage | notes |
 |--------------|-----------|---------|-------|
-| **GPIO4** | SDA | 3.3 V logic | `CONFIG_AS_SENSOR_SDA_GPIO`. Free on ESP32-S3; not a strapping, USB, flash or console pin |
-| **GPIO5** | SCL | 3.3 V logic | `CONFIG_AS_SENSOR_SCL_GPIO` |
+| **GPIO8** | SDA | 3.3 V logic | `CONFIG_AS_SENSOR_SDA_GPIO`. Data line of the shared bus |
+| **GPIO9** | SCL | 3.3 V logic | `CONFIG_AS_SENSOR_SCL_GPIO` |
 | **3V3** | VCC / VIN | **3.3 V** | Do **not** use 5 V. Many breakouts have a regulator and level shifters and will *run* on 5 V, but they then pull SDA/SCL to 5 V, which is out of spec for the ESP32-S3 |
 | **GND** | GND | — | Common ground is required; the bus will not work reliably without it |
-| — | ADDR / SDO | tie to GND or 3V3 | **GND → address `0x76`** (the configured default). 3V3 → `0x77`, which needs `CONFIG_AS_BME280_I2C_ADDR` changed |
+| — | address pin | tie to GND or 3V3 | BME280: `0x76` (GND) / `0x77` (VCC). SHT30: `0x44` (GND) / `0x45` (VCC). The configured address must match — see below |
 
 Bus speed is `CONFIG_AS_I2C_FREQ_HZ` = 400 kHz. The driver enables the ESP32's
 internal pull-ups, but they are weak (~45 kΩ): for reliable 400 kHz operation use
 the pull-ups on the breakout board (most have 4.7 kΩ–10 kΩ) and keep the wires
 short, under about 15 cm.
 
-There is no BH1750 driver in this firmware, so nothing else needs wiring. See
-[`hardware_test_log.md`](hardware_test_log.md) for what is physically attached to
-the development board this project was tested on, and which of those modules the
-firmware can and cannot use.
+**These pins are configuration, not code.** Change
+`CONFIG_AS_SENSOR_SDA_GPIO` / `CONFIG_AS_SENSOR_SCL_GPIO` in
+`firmware/main/config.h` and rebuild; no driver mentions a pin number.
+`scripts/check_config_parity.py` does not check them, because the simulator has no
+notion of a pin.
+
+### Which sensor, and swapping between them
+
+The firmware is **sensor-agnostic**. `sensor.c` owns the API, the read contract and
+the shared I²C bus; the chip-specific work is in a backend behind
+`sensor_backend.h`:
+
+| `CONFIG_AS_SENSOR_BACKEND` | part | channels it provides | address macro |
+|---|---|---|---|
+| `1` | BME280 / BMP280 | temperature, humidity, **pressure** | `CONFIG_AS_BME280_I2C_ADDR` |
+| `2` (default) | SHT30 / SHT3x | temperature, humidity | `CONFIG_AS_SHT30_I2C_ADDR` |
+
+A backend marks the channels it cannot measure **invalid**, and the change detector
+already ignores invalid channels — so swapping sensors changes which numbers
+arrive, never how they are used. Nothing in the change detector, the scheduler, the
+event logic or the simulator is aware of the choice, which is why the published
+simulation results remain valid either way.
+
+Swapping is a one-line change to `CONFIG_AS_SENSOR_BACKEND` (plus the address
+macro if the new part is strapped differently). Both backends are always compiled,
+so neither can rot; the unselected one is dropped by the linker and costs no flash.
+
+Note that **pressure is only available from the BME280 backend**. With an SHT30 the
+pressure channel is invalid and is sent as `"pressure": null` in the MQTT payload,
+rather than as a plausible-looking number.
 
 ### Pins to leave alone
 
@@ -44,11 +70,6 @@ firmware can and cannot use.
 | GPIO43 / GPIO44 | console UART to the USB bridge |
 | GPIO19 / GPIO20 | native USB D− / D+ on the ESP32-S3 |
 | GPIO0 / GPIO3 / GPIO45 / GPIO46 | strapping pins; a pull-up or pull-down here changes the boot mode |
-
-If you move the sensor to different pins, change
-`CONFIG_AS_SENSOR_SDA_GPIO` / `CONFIG_AS_SENSOR_SCL_GPIO` in
-`firmware/main/config.h` and rebuild. `scripts/check_config_parity.py` does not
-check these, because the simulator has no notion of a pin.
 
 To find a sensor you are unsure about, scan the bus rather than guessing:
 `i2c_master_probe()` across `0x08`–`0x77`. Be aware that a *floating* SCL line

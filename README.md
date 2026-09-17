@@ -126,11 +126,19 @@ tuning value is hardcoded in any source file.
   light sleep, and the Wi-Fi driver's PM locks take part in the decision. The
   application never calls `esp_light_sleep_start()`. See
   [docs/power_management.md](docs/power_management.md).
-- **The physical build implements a BME280 only.** The synthetic benchmark
-  includes a light channel to exercise multi-modal behaviour, but there is no
-  BH1750 driver here: the light channel is reported invalid, and the MQTT payload
-  sends `"light": null` plus an explicit `valid` map rather than a plausible `0`.
-  BH1750 support is left as a future hardware extension.
+- **AdaptiveSense is sensor-agnostic.** The sensor layer supports two backends
+  behind one interface and one shared I2C bus, selected by configuration: a
+  **BME280/BMP280** (temperature, humidity, **pressure**) and an **SHT30/SHT3x**
+  (temperature, humidity). Nothing above the sensor layer — change detector,
+  scheduler, event logic, simulator — knows which is in use, because a backend
+  reports the channels it cannot measure as *invalid* and the detector already
+  ignores invalid channels. The physical build validated here runs an SHT30; the
+  published simulation results are unaffected by the choice.
+- **No light sensor driver ships.** The synthetic benchmark includes a light
+  channel to exercise multi-modal behaviour, but the firmware reports it invalid
+  and the MQTT payload sends `"light": null` plus an explicit `valid` map rather
+  than a plausible `0`. The same applies to `pressure` on an SHT30 build. A BH1750
+  driver is a future hardware extension.
 
 ## Experimental design
 
@@ -271,6 +279,7 @@ required of the **numeric** outputs only, and CI enforces that.
 | **BME280 physical sensor validation** | `Not measured yet.` |
 | **Wi-Fi / MQTT multi-cycle hardware run** | `Not measured yet.` |
 | **Power measurement** | `Not measured yet.` — no INA219 / Joulescope / Power Profiler run |
+| Sensor layer, both backends | **Verified** — host-tested protocol layer, and the SHT30 read on hardware (see the test log) |
 | BH1750 light sensor | **Not implemented**; the channel is reported invalid and sent as `null` |
 | Deep sleep | **Experimental, rejected at compile time** — it reboots, so the scheduling state would not survive |
 

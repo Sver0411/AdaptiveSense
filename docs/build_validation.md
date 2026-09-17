@@ -41,15 +41,15 @@ comes from a cold build, not an incremental one.
 [116/116] ... Generated .../bootloader/bootloader.bin
 Bootloader binary size 0x51c0 bytes. 0x2e40 bytes (36%) free.
 [1060/1060] ... Generated .../AdaptiveSense.bin
-AdaptiveSense.bin binary size 0xdc1e0 bytes.
-Smallest app partition is 0x100000 bytes. 0x23e20 bytes (14%) free.
+AdaptiveSense.bin binary size 0xdc890 bytes.
+Smallest app partition is 0x100000 bytes. 0x23770 bytes (14%) free.
 Project build complete.
 ```
 
 | artifact | size |
 |----------|------|
-| `build/AdaptiveSense.bin` | 901 600 bytes (`0xdc1e0`) |
-| `build/AdaptiveSense.elf` | 9 879 476 bytes |
+| `build/AdaptiveSense.bin` | 903 312 bytes (`0xdc890`) |
+| `build/AdaptiveSense.elf` | 9 901 528 bytes |
 | `build/bootloader/bootloader.bin` | 20 928 bytes (`0x51c0`) |
 
 The application image fits the default 1 MiB app partition with 14 % headroom.
@@ -95,7 +95,8 @@ CI:
 | host compile of the MQTT payload builder | `cc -std=c11 -Wall -Wextra -Werror -I firmware/main tests/c_host/payload_host_main.c firmware/main/communication_payload.c` | PASS, no warnings |
 | host compile of the sensor layer (mock mode) | `cc -std=c11 -Wall -Wextra -Werror -DCONFIG_AS_USE_MOCK_SENSOR=1 -Itests/c_host/shims -Ifirmware/main tests/c_host/sensor_host_main.c firmware/main/{sensor,sensor_supervisor,bme280_math}.c -lm` | PASS, no warnings |
 | Python ↔ C policy parity | `python -m pytest tests/test_parity_python_c.py` | PASS (9 tests) |
-| configuration parity | `python scripts/check_config_parity.py` | PASS (47 checks) |
+| host tests of the SHT30 protocol | `python -m pytest tests/test_sensor_sht30.py` | PASS (19 tests) |
+| configuration parity | `python scripts/check_config_parity.py` | PASS (55 checks) |
 
 ## Power-management configuration, verified in the generated sdkconfig
 

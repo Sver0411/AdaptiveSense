@@ -33,23 +33,36 @@ typedef struct {
     bool  valid[SEN_CH_COUNT];
 } sensor_read_t;
 
-/* Initialise the sensor subsystem (I2C, BME280 or mock). Must succeed before
- * sensor_read() will produce a reading. */
+/*
+ * Initialise the sensor subsystem. Must succeed before sensor_read() will produce
+ * a reading.
+ *
+ * Which chip this drives is a configuration choice
+ * (CONFIG_AS_SENSOR_BACKEND): a BME280/BMP280 or an SHT30/SHT3x, or the mock
+ * when CONFIG_AS_USE_MOCK_SENSOR is set. The caller does not need to know which:
+ * a backend reports the channels it cannot measure by leaving them invalid.
+ */
 int sensor_init(void);
 
 /* True once sensor_init() has succeeded. */
 bool sensor_is_initialized(void);
 
 /*
- * Take a single measurement. Returns 0 on success (partial validity is signalled
- * via sensor_read_t.valid), or -1 if the subsystem is not initialised or the
- * transfer failed.
+ * Take a single measurement. Returns 0 on success, -1 on failure.
  *
- * On failure `out` is left untouched: the caller must check the return value and
- * must not treat the buffer as a measurement. Use of a supervisor
- * (sensor_supervisor.c) to decide when to retry init is the caller's job.
+ * On success, read `valid[]` to see which channels carry a real value: a backend
+ * fills in only what its chip can measure (for example an SHT30 has no pressure
+ * channel). A channel with `valid == false` must be ignored by the caller —
+ * its `value` is zero and carries no meaning.
+ *
+ * On failure the return value is -1 and **no** channel is marked valid, so a
+ * caller that ignores the return value cannot mistake the buffer for a
+ * measurement. Before a successful init the buffer is not written to at all.
  */
 int sensor_read(sensor_read_t *out);
+
+/* Human-readable name of the active backend, for logs and the boot banner. */
+const char *sensor_backend_name(void);
 
 /* Human-readable name of a channel, for logging/MQTT build-up. */
 const char *sensor_channel_name(sen_channel_t c);

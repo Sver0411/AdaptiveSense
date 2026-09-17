@@ -37,6 +37,11 @@ CONFIG_H = ROOT / "firmware" / "main" / "config.example.h"
 POLICY_CONFIG_C = ROOT / "firmware" / "main" / "policy_config.c"
 DETECTOR_H = ROOT / "firmware" / "main" / "change_detector.h"
 POWER_MGMT_C = ROOT / "firmware" / "main" / "power_mgmt.c"
+SENSOR_C = ROOT / "firmware" / "main" / "sensor.c"
+SENSOR_BUS_C = ROOT / "firmware" / "main" / "sensor_bus.c"
+SENSOR_BME280_C = ROOT / "firmware" / "main" / "sensor_bme280.c"
+SENSOR_SHT30_C = ROOT / "firmware" / "main" / "sensor_sht30.c"
+SHT30_PROTO_C = ROOT / "firmware" / "main" / "sht30_proto.c"
 MAIN_CMAKE = ROOT / "firmware" / "main" / "CMakeLists.txt"
 SDKCONFIG_DEFAULTS = ROOT / "firmware" / "sdkconfig.defaults"
 
@@ -320,6 +325,59 @@ def structural_checks() -> List[Tuple[str, bool, str]]:
         f"{MAIN_CMAKE.name} REQUIRES esp_pm",
         pm_in_requires,
         "ok" if pm_in_requires else "power_mgmt.c includes esp_pm.h",
+    ))
+
+    # --- sensor layer: one shared bus, backends never own one ----------------
+    #
+    # The SHT30, the BH1750 and the display sit on the same two wires. If a
+    # backend created its own bus, a bring-up retry would fail with "I2C bus id(0)
+    # has already been acquired" — which is exactly what happened on hardware
+    # before the bus was made shared. Checked rather than trusted.
+    sensor_c = strip_c_comments(SENSOR_C.read_text(encoding="utf-8"))
+    bus_c = strip_c_comments(SENSOR_BUS_C.read_text(encoding="utf-8"))
+
+    creates_bus = "i2c_new_master_bus" in bus_c
+    results.append((
+        f"{SENSOR_BUS_C.name} creates the shared i2c bus",
+        creates_bus,
+        "ok" if creates_bus else "nothing would ever create the bus",
+    ))
+
+    for path in (SENSOR_C, SENSOR_BME280_C, SENSOR_SHT30_C):
+        text = strip_c_comments(path.read_text(encoding="utf-8"))
+        owns_bus = "i2c_new_master_bus" in text
+        results.append((
+            f"{path.name} does not create its own i2c bus",
+            not owns_bus,
+            "the bus is shared; a second one fails to acquire" if owns_bus else "ok",
+        ))
+
+    # The protocol layer must stay free of ESP-IDF so it can be host-tested.
+    proto_c = strip_c_comments(SHT30_PROTO_C.read_text(encoding="utf-8"))
+    proto_clean = not re.search(r'#\s*include\s*"(esp_|driver/|freertos/)', proto_c)
+    results.append((
+        f"{SHT30_PROTO_C.name} has no ESP-IDF dependency",
+        proto_clean,
+        "ok" if proto_clean else "the protocol layer must stay host-testable",
+    ))
+
+    # Both backends must be compiled, so neither can rot, and the selection macro
+    # must be one of the two documented values.
+    for src in ("sensor_bme280.c", "sensor_sht30.c"):
+        listed = f'"{src}"' in cmake
+        results.append((
+            f"{MAIN_CMAKE.name} compiles {src}",
+            listed,
+            "ok" if listed else "both backends are always built",
+        ))
+
+    backend_macro = re.search(r"^#define\s+CONFIG_AS_SENSOR_BACKEND\s+(\d+)",
+                              config_h_text, flags=re.M)
+    backend_ok = bool(backend_macro) and backend_macro.group(1) in ("1", "2")
+    results.append((
+        "CONFIG_AS_SENSOR_BACKEND selects a documented backend",
+        backend_ok,
+        f"found {backend_macro.group(1)}" if backend_macro else "macro missing",
     ))
 
     return results

@@ -147,6 +147,166 @@ Both fixes are local to `firmware/main/`. `python -m pytest tests/` still report
 
 ---
 
+## Session 2 — 2026-09-17, SHT30 backend and main-chain verification
+
+Same board as session 1. The goal was to get the real sensor into the main chain
+without touching the algorithm, and the physical modules on hand are an SHT30, a
+GY-302 (BH1750), an OLED and a capacitive soil sensor — no BME280.
+
+### What changed, and what deliberately did not
+
+The sensor layer became **sensor-agnostic**: `sensor.c` keeps the API, the read
+contract and the choice of backend; chip drivers implement `sensor_backend.h`.
+Two backends ship (BME280/BMP280 and SHT30/SHT3x), the bus is owned once by
+`sensor_bus.c` and shared, and the SHT30 protocol (CRC, conversion, sequencing) is
+a pure-C unit tested on the host.
+
+Verified as untouched, by diff rather than by intent:
+
+| file | status |
+|------|--------|
+| `change_detector.c` / `.h` | **unchanged** |
+| `adaptive_scheduler.c` / `.h` | **unchanged** |
+| `simulator/` (scoring, adaptive, events, metrics, replay) | **unchanged** |
+| `analysis/` | **unchanged** |
+| `experiments/experiment_config.yaml` | one non-comment change: `payload_bytes_per_upload` 246 → 244 |
+
+That last change is a *reporting* constant, not a tuning parameter: the SHT30 has
+no pressure channel, so `pressure` is sent as `null`, which is two bytes shorter
+than the number it replaces. Every algorithm parameter (noise floors, thresholds,
+hysteresis, windows, ladders, debounce, upload policy) is byte-identical.
+
+### Noise floors: confirmed to be experiment parameters, not BME280 parameters
+
+Checked rather than assumed, because swapping sensors is exactly when someone
+would be tempted to "recalibrate" them:
+
+| channel | floor in the config | noise sigma injected by the generator | ratio | BME280 datasheet noise |
+|---------|--------------------:|--------------------------------------:|------:|-----------------------:|
+| temperature | 0.15 °C | 0.08 (0.08–1.0 across scenarios) | ≈ 2× | 0.01 °C RMS |
+| humidity | 0.8 %RH | 0.4 (0.4–2.5) | ≈ 2× | 0.012 %RH |
+| pressure | 0.3 hPa | 0.15 (0.15–0.6) | ≈ 2× | 0.12 Pa |
+
+Each floor sits at roughly twice the generator's baseline noise and 10–100× above
+the BME280's own noise, so they describe the **benchmark**, not a chip. They were
+therefore left exactly as they were. Changing them would alter the policy's
+sensitivity and invalidate the published simulation results.
+
+### Unit tests
+
+| check | result |
+|-------|--------|
+| `python -m pytest tests/` | **159 passed** (was 140) |
+| `python scripts/check_config_parity.py` | **PASS, 55 checks** (was 47) |
+| `idf.py build` (ESP-IDF v5.4.4, clean) | **PASS, 0 warnings, 0 errors**, image 903 312 B, 14 % partition headroom |
+
+The 19 new tests cover the SHT30 protocol against frames captured from this device,
+and specifically: a correct frame decodes; a **corrupted CRC makes the measurement
+absent** (outputs untouched, and no half-measurement either); a failed write is
+reported without a subsequent read; a failed or short read is reported; a call with
+no transport at all is refused. The 8 new configuration checks pin the architecture:
+only `sensor_bus.c` creates an I²C bus, no backend does, the protocol layer has no
+ESP-IDF dependency, and both backends are compiled.
+
+### SHT30 continuous read test (120 s at 1 Hz)
+
+A throwaway program that links the *shipping* `sht30_proto.c`, so the CRC and
+conversions under test are the ones in the firmware:
+
+```
+attempts                120
+successful reads        120
+CRC failures            0
+transport failures      0
+NaN values              0
+values out of range     0
+temperature   min 27.14  max 27.26  mean 27.20  C
+humidity      min 57.01  max 57.35  mean 57.18  %RH
+largest step  temperature 0.05 C    humidity 0.07 %RH
+success rate            100.0 %
+```
+
+Range, mean and step size are all consistent with a still room, and there is no
+NaN, no jump and no CRC failure across 120 consecutive readings.
+
+### Main chain on hardware
+
+`SHT30 → sensor_read_t → change detector → adaptive scheduler`, from the serial log
+(the `score` column is computed by the change detector from the SHT30 values, and
+`state`/`interval` come from the scheduler):
+
+```
+main: AdaptiveSense node booting (device=node-01, sensor backend: SHT30 (temperature + humidity))
+sensor_bus: shared i2c bus ready: SDA=GPIO8 SCL=GPIO9 (one bus for every device on it)
+sht30: SHT30 ready at 0x44 (single shot, high repeatability, no clock stretching; channels: temperature, humidity)
+sensor: sensor backend ready: SHT30 (temperature + humidity)
+
+cycle=1  t=0.3    state=0 interval=20.0s score=0.00 event=0 upload_requested=1 publish_call_ok=0 temp=27.15 hum=57.22
+cycle=2  t=20.3   state=0 interval=20.0s score=0.20 event=0 upload_requested=0 publish_call_ok=0 temp=27.13 hum=57.16
+cycle=3  t=40.3   state=0 interval=40.0s score=0.18 event=0 upload_requested=1 publish_call_ok=0 temp=27.14 hum=57.35
+cycle=4  t=80.3   state=0 interval=40.0s score=0.23 event=0 upload_requested=0 publish_call_ok=0 temp=27.11 hum=57.14
+cycle=5  t=120.3  state=0 interval=60.0s score=0.11 event=0 upload_requested=1 publish_call_ok=0 temp=27.13 hum=57.28
+```
+
+What this demonstrates:
+
+* the values are real measurements and agree with the soak test (27.2 °C / 57.2 %RH);
+* the **change detector is running on them** — the score is non-zero and varies;
+* the **interval ladder behaves exactly as unit-tested**: 20, 20, 40, 40, 60, which
+  is STABLE `[20, 40, 60]` with `confirmations = 2`
+  (`tests/test_scheduler.py::test_stable_signal_backs_off_to_max_interval`);
+* the **upload policy fired on the first sample and on each interval change**, and
+  not on cycles 2 and 4 — which is the documented policy;
+* `publish_call_ok=0` is the *transport* failing (the broker URI is still a
+  placeholder), reported as such rather than being hidden;
+* no panic, no watchdog, no `ESP_ERR_*`, no CRC complaint.
+
+Not yet exercised on hardware: a **state transition**. The room was still, so the
+node correctly stayed in STABLE. Provoking ACTIVE/ALERT needs a real disturbance —
+warming the sensor with a finger is enough, since a 1 °C step is ≈ 6.7 noise floors
+against the ACTIVE entry bound of 4.5.
+
+### I2C bus wedge: observed, recovered, trigger not reproduced
+
+While probing measurement commands, the shared bus was found **wedged**: SCL held
+low, and all three devices (SHT30 `0x44`, BH1750 `0x23`, display `0x3C`) replying
+`ESP_ERR_TIMEOUT`. Manual recovery — clocking SCL by hand ≥ 9 times then issuing a
+STOP — released it, and all three answered immediately afterwards:
+
+| | SDA | SCL | probes |
+|---|-----|-----|--------|
+| before recovery | 1 | **0 (held)** | 0x44 / 0x23 / 0x3C all `ESP_ERR_TIMEOUT` |
+| after recovery | 1 | 1 | 0x44 / 0x23 / 0x3C all **ACK**, 0x45 correctly absent |
+
+**Honest limitation:** the trigger was not reproduced. Replaying the exact command
+sequence that preceded the wedge (`0x2C06`, a successful read, two reads that return
+`ESP_ERR_INVALID_STATE`, then a failed `0x240B` write) leaves the bus healthy
+(`SDA=1 SCL=1`), so the sequence alone does not cause it. The most likely cause is
+the chip being reset *during* a transfer — the wedge was noticed after a re-flash —
+but that has not been demonstrated.
+
+That notwithstanding, `sensor_bus.c` now performs the same recovery sequence at
+bring-up, because the failure mode is real and its consequence is severe: a slave
+holding a line low keeps the bus dead, so every retry fails and the node never
+comes up. The recovery code itself has been exercised against the wedged bus
+through the throwaway tool; it has not yet been needed by the firmware in the
+field.
+
+### Open items from this session
+
+1. **A state transition has not been seen on hardware** (see above).
+2. **Bus recovery runs at every bring-up but has not yet had to fire.** It is
+   defensive; the trigger remains unidentified.
+3. **`pressure` is unavailable on this build** — an SHT30 has no pressure sensor,
+   and the `pressure` channel is reported invalid and sent as `null`.
+4. **The BH1750, the OLED and the soil sensor remain unused** and no driver for
+   them exists. The light channel of the benchmark therefore still has no hardware
+   counterpart.
+5. **Wi-Fi/MQTT still use placeholder credentials**, so `publish_call_ok` is 0 and
+   the upload path is only verified up to the MQTT client call.
+
+---
+
 ## Method notes
 
 Two things were needed to test at all from a scripted session, and both are

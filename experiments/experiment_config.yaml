@@ -44,6 +44,15 @@ adaptive:
   # temperature, humidity and pressure can be compared on one scale.
   # The noise floor is ALSO the normaliser for the upload delta (§8).
   channels:
+    # These floors are EXPERIMENT parameters, not datasheet figures for any
+    # particular chip. For the three main channels each floor is about twice the
+    # noise sigma the dataset generator injects (0.08 C -> 0.15, 0.4 %RH -> 0.8,
+    # 0.15 hPa -> 0.3), and they sit 10-100x above the noise of the BME280 itself
+    # (0.01 C / 0.012 %RH RMS). They describe the benchmark, and they are
+    # therefore NOT changed when the physical sensor changes: doing so would alter
+    # the policy's sensitivity and invalidate the published simulation results.
+    # The light floor is the one exception to the 2x pattern; it is left as-is for
+    # the same reason. Evidence: docs/hardware_test_log.md.
     temperature:
       noise_floor: 0.15        # °C
       use: true
@@ -107,15 +116,20 @@ adaptive:
   # These are PROXY constants. No physical energy unit is claimed.
   energy:
     # Size of one MQTT payload as produced by the firmware's own builder
-    # (firmware/main/communication_payload.c) for the shipped configuration: a
-    # BME280-only build, so `"light": null` and `valid.light == false`, with a
-    # 10-digit millisecond timestamp: 246 bytes.
+    # (firmware/main/communication_payload.c), for the shipped configuration and
+    # a 10-digit millisecond timestamp.
     #
-    # It is a measurement of that form, not a wire-protocol frame size: the JSON
-    # is built with fixed precision, so the length moves with the number of
-    # integer digits in the readings. tests/test_communication_payload.py pins
-    # the shipped form against this value and documents the variation.
-    payload_bytes_per_upload: 246
+    # It depends on which sensor backend is selected, because a backend reports
+    # the channels it cannot measure as invalid and an invalid channel is sent as
+    # JSON `null`:
+    #
+    #   CONFIG_AS_SENSOR_BACKEND=1 (BME280)  pressure valid   -> 246 bytes
+    #   CONFIG_AS_SENSOR_BACKEND=2 (SHT30)   pressure invalid -> 244 bytes
+    #
+    # The value below matches the selected backend, and
+    # tests/test_communication_payload.py derives the expected form from the same
+    # configuration, so the two cannot drift apart.
+    payload_bytes_per_upload: 244
     upload_energy_units_per_upload: 1.0   # dimensionless proxy
 
   # Seed for the replay simulator's tie-breaking / noise, kept for

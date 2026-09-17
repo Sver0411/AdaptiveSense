@@ -93,7 +93,8 @@ static void log_periodic_stats(unsigned long cycle)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "AdaptiveSense node booting (device=%s)", CONFIG_AS_DEVICE_ID);
+    ESP_LOGI(TAG, "AdaptiveSense node booting (device=%s, sensor backend: %s)",
+             CONFIG_AS_DEVICE_ID, sensor_backend_name());
 
     /* Power management first: arm automatic light sleep before anything starts
      * acquiring PM locks, so the Wi-Fi driver sees the final configuration. */

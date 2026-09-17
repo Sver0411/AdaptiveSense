@@ -40,15 +40,30 @@ flowchart LR
 
 ## Layering
 
-### Sensor layer — `sensor.c`, `sensor_supervisor.c`, `bme280_math.c`, `sensor.h`
+### Sensor layer — `sensor.c`, `sensor_backend.h`, backends, `sensor_bus.c`, `sensor_supervisor.c`
 
-`bme280_math.c` is pure C99 with no ESP-IDF dependency: calibration parsing, raw
-register decoding and the vendor compensation equations, all host-testable.
-`sensor.c` owns I²C transport, chip bring-up, the forced-mode measurement sequence
-with its bounded wait, and the read contract — nothing is read before a successful
-init. `sensor_supervisor.c` is also pure C and holds the decision of *when* to
-retry bring-up (rate-limited, never a busy loop), so that policy is unit-tested
-rather than buried in the main loop.
+The sensor layer is **sensor-agnostic**. `sensor.c` owns only the public API, the
+read contract (nothing is read before a successful init) and the choice of
+backend; `sensor_backend.h` is the interface a chip driver implements:
+
+| file | role |
+|------|------|
+| `sensor.c` | API, read contract, backend selection, mock override |
+| `sensor_backend.h` | the backend interface (`init` / `read` / `teardown`) |
+| `sensor_bme280.c` | BME280/BMP280 backend: temperature, humidity, pressure |
+| `sensor_sht30.c` | SHT30/SHT3x backend: temperature, humidity |
+| `sht30_proto.c` | SHT30 protocol (CRC, conversion, sequencing) — pure C, host-tested |
+| `bme280_math.c` | BME280 calibration and compensation — pure C, host-tested |
+| `sensor_bus.c` | the single shared I²C bus, created once and released only on wedge |
+| `sensor_supervisor.c` | *when* to retry bring-up — pure C, host-tested |
+
+A backend reports the channels it cannot measure by leaving them invalid, and the
+change detector already ignores invalid channels — so swapping sensors changes
+which numbers arrive, never how they are used. Backends never create an I²C bus:
+`sensor_bus.c` owns it, so the SHT30, the BH1750 and the display can share the two
+wires, and a bring-up retry cannot lose or duplicate the bus. `sensor_bus.c` also
+performs I²C bus recovery at bring-up, because a slave holding a line low would
+otherwise keep the node dead across every retry.
 
 ### Change-detection layer — `change_detector.c`, `change_detector.h`
 
