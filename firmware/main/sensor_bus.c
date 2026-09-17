@@ -17,6 +17,40 @@ static const char *TAG = "sensor_bus";
 static i2c_master_bus_handle_t s_bus = NULL;
 
 /*
+ * Settling time after releasing an open-drain line before trusting its level.
+ * 45 kOhm against a short bus is a few microseconds of rise time; 2 ms is
+ * comfortably clear of it.
+ */
+#define BUS_SETTLE_MS 2
+
+/* Lines as inputs, with the internal pull-up: the only mode in which a level can
+ * actually be read. See the note below. */
+static void lines_as_inputs(int sda, int scl)
+{
+    const gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << sda) | (1ULL << scl),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&cfg);
+}
+
+/* Lines as open-drain outputs: released when written 1, driven low when written 0. */
+static void lines_as_open_drain(int sda, int scl)
+{
+    const gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << sda) | (1ULL << scl),
+        .mode = GPIO_MODE_OUTPUT_OD,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&cfg);
+}
+
+/*
  * Free a bus whose lines are being held low by a slave.
  *
  * A slave that is mid-transaction when the master resets — or that has been asked
@@ -25,42 +59,49 @@ static i2c_master_bus_handle_t s_bus = NULL;
  * observed on hardware: SCL read low, all three devices (SHT30, BH1750, display)
  * timed out, and they all answered again after the sequence below.
  *
- * The fix is the standard one: clock SCL by hand at least nine times while SDA is
- * released, so the slave shifts out the rest of its byte, then issue a STOP.
- *
  * Doing this at bring-up matters more than it looks: without it, a node that
  * happened to reset mid-transfer would stay dead across every retry, because the
  * bus itself is what is broken.
+ *
+ * MEASURING vs DRIVING — the subtlety that made the first version of this
+ * function wrong. `gpio_get_level()` reads the input register, and configuring a
+ * pin as GPIO_MODE_OUTPUT_OD leaves its input buffer disabled, so the read
+ * returns a constant 0 whether the line is released high or driven low. The first
+ * version therefore diagnosed every healthy bus as wedged, at every boot. Measured
+ * on the board:
+ *
+ *     OUTPUT_OD, released (high)   -> reads 0
+ *     OUTPUT_OD, driven low        -> reads 0     (indistinguishable)
+ *     INPUT with pull-up           -> reads 1     (the same line, sampled properly)
+ *
+ * So levels are only ever sampled with the pins configured as inputs, and the
+ * pins are switched to open-drain only for the clocking.
  */
 static void bus_recover_lines(void)
 {
     const int sda = CONFIG_AS_SENSOR_SDA_GPIO;
     const int scl = CONFIG_AS_SENSOR_SCL_GPIO;
 
-    gpio_config_t od_config = {
-        .pin_bit_mask = (1ULL << sda) | (1ULL << scl),
-        .mode = GPIO_MODE_OUTPUT_OD, /* open drain: 1 releases the line */
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&od_config);
+    /* --- measure the idle state, as inputs ---------------------------------- */
+    lines_as_inputs(sda, scl);
+    vTaskDelay(pdMS_TO_TICKS(BUS_SETTLE_MS));
 
-    /* Release both lines before clocking. */
-    gpio_set_level((gpio_num_t)sda, 1);
-    gpio_set_level((gpio_num_t)scl, 1);
-    esp_rom_delay_us(5);
-
-    bool sda_stuck = (gpio_get_level((gpio_num_t)sda) == 0);
-    bool scl_stuck = (gpio_get_level((gpio_num_t)scl) == 0);
-    if (!sda_stuck && !scl_stuck) {
+    const int sda_idle = gpio_get_level((gpio_num_t)sda);
+    const int scl_idle = gpio_get_level((gpio_num_t)scl);
+    if (sda_idle != 0 && scl_idle != 0) {
         gpio_reset_pin((gpio_num_t)sda);
         gpio_reset_pin((gpio_num_t)scl);
-        return; /* bus is healthy; leave it alone */
+        return; /* bus is healthy; leave it alone and say nothing */
     }
 
-    ESP_LOGW(TAG, "i2c lines held low (SDA=%d SCL=%d); recovering",
-             (int)sda_stuck, (int)scl_stuck);
+    ESP_LOGW(TAG, "i2c lines not idling high (SDA=%d SCL=%d); recovering",
+             sda_idle, scl_idle);
+
+    /* --- clock SCL by hand, as open-drain ----------------------------------- */
+    lines_as_open_drain(sda, scl);
+    gpio_set_level((gpio_num_t)sda, 1); /* release */
+    gpio_set_level((gpio_num_t)scl, 1);
+    esp_rom_delay_us(5);
 
     for (int i = 0; i < 16; i++) {
         gpio_set_level((gpio_num_t)scl, 0);
@@ -75,11 +116,15 @@ static void bus_recover_lines(void)
     gpio_set_level((gpio_num_t)scl, 1);
     esp_rom_delay_us(5);
     gpio_set_level((gpio_num_t)sda, 1);
-    esp_rom_delay_us(5);
 
-    const bool still_stuck = (gpio_get_level((gpio_num_t)sda) == 0) ||
-                             (gpio_get_level((gpio_num_t)scl) == 0);
-    ESP_LOGW(TAG, "bus recovery %s", still_stuck ? "did not clear the lines" : "released both lines");
+    /* --- verify, as inputs again -------------------------------------------- */
+    lines_as_inputs(sda, scl);
+    vTaskDelay(pdMS_TO_TICKS(BUS_SETTLE_MS));
+    const int sda_after = gpio_get_level((gpio_num_t)sda);
+    const int scl_after = gpio_get_level((gpio_num_t)scl);
+    ESP_LOGW(TAG, "bus recovery done: SDA=%d SCL=%d (%s)", sda_after, scl_after,
+             (sda_after != 0 && scl_after != 0) ? "lines released"
+                                                : "still not idle high");
 
     /* Hand the pins back so the I2C driver can claim them. */
     gpio_reset_pin((gpio_num_t)sda);

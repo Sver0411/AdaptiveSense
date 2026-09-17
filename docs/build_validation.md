@@ -41,14 +41,14 @@ comes from a cold build, not an incremental one.
 [116/116] ... Generated .../bootloader/bootloader.bin
 Bootloader binary size 0x51c0 bytes. 0x2e40 bytes (36%) free.
 [1060/1060] ... Generated .../AdaptiveSense.bin
-AdaptiveSense.bin binary size 0xdc890 bytes.
-Smallest app partition is 0x100000 bytes. 0x23770 bytes (14%) free.
+AdaptiveSense.bin binary size 0xdc920 bytes.
+Smallest app partition is 0x100000 bytes. 0x236e0 bytes (14%) free.
 Project build complete.
 ```
 
 | artifact | size |
 |----------|------|
-| `build/AdaptiveSense.bin` | 903 312 bytes (`0xdc890`) |
+| `build/AdaptiveSense.bin` | 904 480 bytes (`0xdc920`) |
 | `build/AdaptiveSense.elf` | 9 901 528 bytes |
 | `build/bootloader/bootloader.bin` | 20 928 bytes (`0x51c0`) |
 

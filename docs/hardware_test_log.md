@@ -307,6 +307,115 @@ field.
 
 ---
 
+## Session 3 — 2026-09-17, state machine on hardware, and a bug in the bus recovery
+
+Same board, same firmware as session 2. The goal was to provoke an actual state
+transition, which session 2 had not managed because the room was still.
+
+Method: the operator pressed a finger on the SHT30 for about two and a half
+minutes while the serial console was captured. Long enough to matter because the
+node had already backed off to a 60 s interval.
+
+### Result: all three states, and the transitions between them
+
+| cycle | t (s) | state | interval | score | event | upload | T (°C) | RH (%) | |
+|------:|------:|-------|---------:|------:|------:|-------:|-------:|-------:|---|
+| 1 | 0.3 | STABLE | 20 s | 0.00 | 0 | yes | 28.61 | 58.08 | |
+| 2 | 20.3 | **ACTIVE** | 15 s | 4.90 | 0 | yes | 27.88 | 55.30 | score ≥ `stable_high` (4.5) |
+| 3 | 35.3 | ACTIVE | 10 s | 4.62 | 0 | yes | 27.73 | 55.41 | ladder descends |
+| 4 | 45.3 | ACTIVE | 5 s | 4.07 | 0 | yes | 27.68 | 55.63 | ladder floor |
+| 7 | 60.3 | ACTIVE | 5 s | 6.95 | 0 | yes | 29.16 | 56.44 | |
+| 10 | 75.2 | **ALERT** | 5 s | 12.04 | 0 | yes | 29.98 | 63.31 | score ≥ `active_high` (12.0) |
+| 11 | 80.2 | ALERT | 5 s | 16.45 | 0 | yes | 30.78 | 66.49 | |
+| 12 | 85.2 | ALERT | 5 s | 15.47 | 0 | yes | 30.83 | 64.56 | |
+| 13 | 90.2 | ALERT | 5 s | 14.94 | **1** | yes | 30.93 | 64.71 | debounce latched: score > 8 for 15 s |
+| 21 | 130.2 | ALERT | 5 s | 4.29 | 0 | no | 28.62 | 53.73 | |
+| 22 | 135.2 | **ACTIVE** | 15 s | 3.34 | 0 | yes | 28.55 | 54.22 | score < `active_low` (4.0) → one level down |
+| 23 | 150.2 | ACTIVE | 10 s | 6.73 | 0 | yes | 28.64 | 62.08 | |
+| 24 | 160.2 | **ALERT** | 5 s | 18.09 | 0 | yes | 28.98 | 72.24 | re-escalated immediately |
+
+Temperature range 27.64 – 30.93 °C, humidity 53.19 – 72.24 %RH; the finger moved
+both channels, which is what the score responds to. Interval sequence:
+`20, 15, 10, 5 … 5, 15, 10, 5 …`.
+
+What this confirms, on real hardware, with real sensor data:
+
+* **escalation is immediate and multi-level** — STABLE went to ACTIVE on one
+  sample, and ACTIVE to ALERT on one sample;
+* **the ACTIVE ladder descends** 15 → 10 → 5, i.e. the node samples *faster* once
+  change is detected (the defect this ladder was fixed for in v0.3);
+* **the event debounce works**: the event bit latched at cycle 13, after the score
+  had stayed above `event_threshold` (8.0) from t = 75.2 s to 90.2 s — 15 s, more
+  than `event_min_duration_s` (10 s);
+* **de-escalation moves exactly one level**: ALERT stepped down to ACTIVE when the
+  score fell to 3.34 (< `active_low` 4.0), and did **not** jump to STABLE — the
+  asymmetry introduced in v0.3;
+* **re-escalation is immediate** again (cycle 24, score 18.09);
+* uploads followed state and interval changes, as designed.
+
+This is the end-to-end behaviour the simulator's unit tests describe, reproduced
+on the physical device.
+
+### Bug found: the bus recovery diagnosed a wedge on a healthy bus
+
+The same boot log contained:
+
+```
+W (1128) sensor_bus: i2c lines held low (SDA=1 SCL=1); recovering
+W (1134) sensor_bus: bus recovery did not clear the lines
+```
+
+The `1 1` were *booleans*, i.e. both lines had been read as low — and yet the very
+next lines show the bus coming up and the SHT30 being found. So the readings were
+wrong, not the bus.
+
+**Root cause, established by experiment rather than guessed.** The first version
+configured the pins as `GPIO_MODE_OUTPUT_OD` and then called
+`gpio_get_level()` on them. That mode disables the pin's input buffer, so the read
+returns a constant 0 — it cannot tell "released high" from "driven low". Measured
+on the board with the two lines left alone between cases:
+
+| pin mode | what was done | `gpio_get_level()` |
+|----------|---------------|--------------------|
+| `OUTPUT_OD` | released (written 1) | **0** |
+| `OUTPUT_OD` | driven low (written 0) | **0** — indistinguishable |
+| `INPUT` + pull-up | nothing (same line!) | **1** |
+
+So the recovery's trigger was never a level measurement at all: it read a constant
+0 and therefore declared *every* boot a wedge, then reported a verdict from the
+same broken reading. Two alarming warnings and 16 pointless clock pulses on every
+start, on a bus that was fine.
+
+An intermediate hypothesis — that the line had not finished rising from the weak
+internal pull-up — was **wrong**, and is recorded here because the first version of
+this note stated it. The 2 ms settle below is still worth having, but it was not
+the cause.
+
+**Fix:** sample levels only with the pins configured as **inputs** (input buffer
+enabled, internal pull-up on), and switch to open-drain exclusively for the
+clocking phase. Both the trigger and the verdict now read the line honestly, and a
+healthy bus produces no output at all. The build log after the fix:
+
+```
+sensor_bus: shared i2c bus ready: SDA=GPIO8 SCL=GPIO9 (one bus for every device on it)
+sht30: SHT30 ready at 0x44 (single shot, high repeatability, no clock stretching; channels: temperature, humidity)
+sensor: sensor backend ready: SHT30 (temperature + humidity)
+```
+
+This is the second defect in this session that only hardware could have surfaced —
+it compiles, it looks reasonable, and it lies.
+
+### Open items after session 3
+
+1. The bus recovery **trigger remains unidentified** — it has still never been made
+   to fire deliberately. It is defensive, and it now at least does not fire
+   spuriously.
+2. `publish_call_ok` is still 0 (placeholder broker), so the upload path is verified
+   only as far as the MQTT client call.
+3. The BH1750, the OLED and the soil sensor remain unused.
+
+---
+
 ## Method notes
 
 Two things were needed to test at all from a scripted session, and both are
