@@ -40,12 +40,29 @@
 #include "config_include.h"
 #include "sensor.h"
 #include "sensor_backend.h"
+/* Header-only in every build: the result codes are plain macros and the mock
+ * build needs them. The implementation is only linked (and called) in a device
+ * build — see apply_optional_light(). */
+#include "sensor_bh1750.h"
 
 #if !CONFIG_AS_USE_MOCK_SENSOR
 #include "sensor_bus.h"
 #endif
 
 static const char *TAG = "sensor";
+
+#if CONFIG_AS_USE_MOCK_SENSOR
+/* How the optional light channel should behave in the mock build, so the merge
+ * rules can be tested on a host: present, failing, or absent. */
+typedef enum {
+    MOCK_LIGHT_OK = 0,
+    MOCK_LIGHT_FAIL,
+    MOCK_LIGHT_ABSENT
+} mock_light_mode_t;
+
+static mock_light_mode_t s_mock_light = MOCK_LIGHT_OK;
+static bool s_mock_read_fails = false;
+#endif
 
 /* Set to true only by a sensor_init() that actually succeeded. Invariant:
  * `s_sensor_initialized == (s_active != NULL)` in non-mock builds. */
@@ -82,6 +99,23 @@ void sensor_mock_stats(sensor_mock_stats_t *out)
     out->init_failures = s_mock_init_failures;
     out->read_calls = s_mock_read_calls;
     out->backend_live = s_mock_backend_live;
+}
+
+void sensor_mock_set_read_failure(bool should_fail)
+{
+    s_mock_read_fails = should_fail;
+}
+
+/*
+ * Mock-only seam for the optional light channel. `mode` is one of 0 = present,
+ * 1 = attempted and failed, 2 = absent (no attempt made). All three leave the
+ * primary channels untouched, which is the behaviour the merge rules are about.
+ */
+void sensor_mock_set_bh1750(int mode)
+{
+    s_mock_light = (mode == 1) ? MOCK_LIGHT_FAIL
+                 : (mode == 2) ? MOCK_LIGHT_ABSENT
+                 : MOCK_LIGHT_OK;
 }
 #endif
 
@@ -185,8 +219,80 @@ int sensor_init(void)
     s_active = backend;
     s_sensor_initialized = true;
     ESP_LOGI(TAG, "sensor backend ready: %s", backend->name);
+
+#if CONFIG_AS_USE_BH1750
+    /*
+     * Arm the optional light channel. It is deliberately not probed here: the
+     * primary backend is up, so the node can measure, and an absent light sensor
+     * is discovered by the first measurement rather than assumed now. Arming
+     * cannot fail, so it cannot change the result of bring-up — the light
+     * channel must never be able to prevent the node from starting.
+     */
+    sensor_bh1750_init();
+#endif
     return 0;
 #endif /* CONFIG_AS_USE_MOCK_SENSOR */
+}
+
+#if CONFIG_AS_USE_MOCK_SENSOR
+static int mock_light_read(float *lux)
+{
+    if (s_mock_light == MOCK_LIGHT_ABSENT) {
+        return BH1750_READ_SKIP;
+    }
+    if (s_mock_light == MOCK_LIGHT_FAIL) {
+        return BH1750_READ_FAIL;
+    }
+    static uint32_t lstep = 0;
+    *lux = 320.0f + 3.0f * sinf((float)lstep * 0.02f);
+    lstep++;
+    return BH1750_READ_OK;
+}
+#endif /* CONFIG_AS_USE_MOCK_SENSOR */
+
+/*
+ * The optional light channel, merged into a measurement the primary backend has
+ * already produced.
+ *
+ * Why this exists as a separate step. The BH1750 is not a third entry in
+ * CONFIG_AS_SENSOR_BACKEND: that option selects which chip provides the primary
+ * environmental reading, and the light sensor adds one channel alongside it
+ * rather than replacing it. So the primary backend is read first, and only then
+ * is the light channel filled in.
+ *
+ * Why a light failure is not a measurement failure. The light sensor is optional.
+ * If it fails — or is not fitted, or has just been unplugged — the temperature
+ * and humidity the node exists to report are still perfectly good, and tearing
+ * the whole measurement down because a decorative channel went quiet would be a
+ * bug, not caution. The light channel is simply marked invalid, which is exactly
+ * the signal the change detector already uses to skip a channel.
+ *
+ * This layer still knows nothing about the detector, the scheduler, MQTT or
+ * events: it either has a lux value or it does not.
+ */
+static void apply_optional_light(sensor_read_t *out)
+{
+    out->value[SEN_CH_LIGHT] = 0.0f;
+    out->valid[SEN_CH_LIGHT] = false;
+
+    /* If the policy excludes the channel, do not spend conversion time on it. */
+#if !CONFIG_AS_USE_LIGHT
+    return;
+#else
+    float lux = 0.0f;
+    int rc;
+#if CONFIG_AS_USE_MOCK_SENSOR
+    rc = mock_light_read(&lux);
+#elif CONFIG_AS_USE_BH1750
+    rc = sensor_bh1750_read_lux(&lux);
+#else
+    rc = BH1750_READ_SKIP;   /* no light driver in this build */
+#endif
+    if (rc == BH1750_READ_OK) {
+        out->value[SEN_CH_LIGHT] = lux;
+        out->valid[SEN_CH_LIGHT] = true;
+    }
+#endif /* CONFIG_AS_USE_LIGHT */
 }
 
 int sensor_read(sensor_read_t *out)
@@ -206,7 +312,13 @@ int sensor_read(sensor_read_t *out)
     /* Counted here, i.e. only once the contract has allowed the read, so the
      * counter shows whether a rejected call ever reached a backend. */
     s_mock_read_calls++;
+    if (s_mock_read_fails) {
+        /* The primary measurement failed: no channel is usable, including light.
+         * The caller sees -1 and nothing is valid. */
+        return -1;
+    }
     mock_fill(out);
+    apply_optional_light(out);
     return 0;
 #else
     if (s_active == NULL || s_active->read == NULL) {
@@ -215,7 +327,13 @@ int sensor_read(sensor_read_t *out)
     /* The backend fills in only the channels it can measure; everything else
      * stays zero with valid == false, which is how the detector is told to
      * ignore it. On failure no channel is left valid. */
-    return s_active->read(out);
+    if (s_active->read(out) != 0) {
+        return -1;
+    }
+    /* The primary measurement succeeded, so the sample is usable. Whether the
+     * optional light channel has a value is a separate question. */
+    apply_optional_light(out);
+    return 0;
 #endif /* CONFIG_AS_USE_MOCK_SENSOR */
 }
 

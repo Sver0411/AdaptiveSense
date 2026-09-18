@@ -94,6 +94,9 @@ SPEC: Sequence[Tuple[str, str, str]] = (
     ("firmware.mqtt_keepalive_s", "CONFIG_AS_MQTT_KEEPALIVE_S", "float"),
     ("firmware.sensor_failures_before_unavailable",
      "CONFIG_AS_SENSOR_FAILURES_BEFORE_UNAVAILABLE", "int"),
+    ("firmware.use_bh1750", "CONFIG_AS_USE_BH1750", "bool"),
+    ("firmware.bh1750_i2c_addr", "CONFIG_AS_BH1750_I2C_ADDR", "int"),
+    ("firmware.bh1750_meas_time_ms", "CONFIG_AS_BH1750_MEAS_TIME_MS", "int"),
 )
 
 REL_TOL = 1e-6
@@ -137,6 +140,10 @@ def parse_scalar(raw: str) -> Number:
         cleaned = cleaned[len("(bool)"):].strip()
     if cleaned.startswith("(") and cleaned.endswith(")"):
         cleaned = cleaned[1:-1].strip()
+    if cleaned.lower().startswith("0x"):
+        # Hex literals, e.g. I2C addresses (`0x23`). Plain int() would reject
+        # them outright, so they are decoded explicitly.
+        return int(cleaned, 16)
     return float(cleaned) if ("." in cleaned or "e" in cleaned.lower()) else int(cleaned)
 
 

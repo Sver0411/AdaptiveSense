@@ -2,13 +2,27 @@
  * sensor.h — Sensor Layer.
  *
  * Abstracts the physical transducer(s) behind a small interface so the rest of
- * the system never depends on the specific chip. Primary sensor: BME280
- * (temperature / humidity / pressure) over I2C. An optional therma/light input
- * (BH1750) shares the same read struct.
+ * the system never depends on the specific chip.
  *
- * When CONFIG_AS_USE_MOCK_SENSOR is enabled a deterministic mock is used
- * instead, which lets the firmware logic be exercised without hardware. A mock
- * is clearly labeled: it is never reported as a real measurement.
+ * Two independent things are configured here, and it matters that they are not
+ * the same thing:
+ *
+ *   the primary environmental backend   CONFIG_AS_SENSOR_BACKEND, one of SHT30
+ *                                       (temperature + humidity) or BME280
+ *                                       (temperature + humidity + pressure)
+ *
+ *   the optional light channel          CONFIG_AS_USE_BH1750, a BH1750 / GY-302
+ *                                       that provides `light` alongside whatever
+ *                                       the primary backend produced
+ *
+ * The light sensor is not a third backend: it never replaces the primary one, it
+ * adds a channel to it. On the physical build the SHT30 supplies temperature and
+ * humidity, the BH1750 supplies light, and pressure stays invalid because nothing
+ * on the board measures it.
+ *
+ * When CONFIG_AS_USE_MOCK_SENSOR is enabled a deterministic mock is used instead,
+ * which lets the firmware logic be exercised without hardware. A mock is clearly
+ * labeled: it is never reported as a real measurement.
  */
 #ifndef ADAPTIVESENSE_SENSOR_H
 #define ADAPTIVESENSE_SENSOR_H
@@ -50,10 +64,15 @@ bool sensor_is_initialized(void);
 /*
  * Take a single measurement. Returns 0 on success, -1 on failure.
  *
- * On success, read `valid[]` to see which channels carry a real value: a backend
- * fills in only what its chip can measure (for example an SHT30 has no pressure
- * channel). A channel with `valid == false` must be ignored by the caller —
- * its `value` is zero and carries no meaning.
+ * On success, read `valid[]` to see which channels carry a real value: the
+ * primary backend fills in only what its chip can measure (for example an SHT30
+ * has no pressure channel), and the optional light channel fills `light` only if
+ * the BH1750 answered. A channel with `valid == false` must be ignored by the
+ * caller — its `value` is zero and carries no meaning.
+ *
+ * A failing light sensor does **not** fail the measurement: temperature and
+ * humidity are still reported and only `light` is marked invalid. A failing
+ * primary backend does fail it. See `apply_optional_light()` in sensor.c.
  *
  * On failure the return value is -1 and **no** channel is marked valid, so a
  * caller that ignores the return value cannot mistake the buffer for a
@@ -86,6 +105,18 @@ typedef struct {
 } sensor_mock_stats_t;
 
 void sensor_mock_stats(sensor_mock_stats_t *out);
+
+/* Make the next sensor_read() fail at the primary backend. This is the case that
+ * must take the whole measurement down, unlike a failure of the optional light
+ * channel. */
+void sensor_mock_set_read_failure(bool should_fail);
+
+/*
+ * Control the optional light channel: 0 = present and measuring,
+ * 1 = attempted and failed, 2 = absent (no attempt made). All three leave the
+ * primary channels alone, which is what the merge tests assert.
+ */
+void sensor_mock_set_bh1750(int mode);
 #endif
 
 /* Human-readable name of a channel, for logging/MQTT build-up. */

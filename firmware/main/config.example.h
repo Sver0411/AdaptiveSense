@@ -108,6 +108,30 @@
 #define CONFIG_AS_SHT30_I2C_ADDR      0x44
 
 /*
+ * Optional light channel: a BH1750 / GY-302 sharing the same two wires as the
+ * primary backend. It is deliberately NOT a third value of
+ * CONFIG_AS_SENSOR_BACKEND — it adds the `light` channel alongside whatever the
+ * primary backend measured, and its failure marks only that channel invalid.
+ *
+ *   BH1750 / GY-302: 0x23 (ADDR pin low) or 0x5C (ADDR pin high)
+ */
+#define CONFIG_AS_USE_BH1750          1
+#define CONFIG_AS_BH1750_I2C_ADDR     0x23
+
+/*
+ * Conversion wait for a one-shot H-resolution measurement (command 0x20). 180 ms
+ * is the datasheet maximum at the default MTreg (69); the typical value is 120 ms.
+ * The driver waits this once per sample and never polls for completion, so the
+ * wait is bounded and a failure returns an error rather than hanging.
+ *
+ * One-shot rather than continuous mode (0x10) because the node samples every
+ * 5-60 s: continuous mode re-converts about every 120 ms and keeps drawing
+ * measurement current in between, including while the ESP32 is in light sleep
+ * and the board's 3.3 V rail is still up.
+ */
+#define CONFIG_AS_BH1750_MEAS_TIME_MS 180
+
+/*
  * How many consecutive read failures it takes to conclude that a sensor which
  * WAS working has gone away, after which bring-up is re-attempted under the
  * rate limit in sensor_supervisor.c.

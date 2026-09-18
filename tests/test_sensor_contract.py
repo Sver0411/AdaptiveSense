@@ -184,3 +184,79 @@ def test_every_attempt_is_counted(sensor_host):
     assert steps["first_init"]["init_calls"] == "1"
     assert steps["second_init"]["init_calls"] == "2"
     assert steps["third_init"]["init_calls"] == "3"
+
+
+# ---------------------------------------------------------------------- #
+# channel merge: the primary backend plus the optional light channel
+#
+# The light sensor is not a third backend - it adds one channel alongside
+# whatever the primary backend measured. The rule that matters is the asymmetry:
+#
+#   primary fails  -> the whole measurement fails, nothing is valid
+#   light fails    -> only `light` is invalid, and the measurement still succeeds
+#
+# A node that reports temperature and humidity must not go dark because an
+# optional, decorative channel went quiet.
+#
+# Note on pressure: in the *mock* build every channel including pressure reads as
+# valid, because the mock predates the SHT30 default and models a part that
+# measures everything. That is a property of the mock, not a claim about the
+# device; on the real build the SHT30 backend leaves pressure invalid, which is
+# verified on hardware. These tests therefore assert on temperature, humidity and
+# light - the channels the merge rules actually govern.
+# ---------------------------------------------------------------------- #
+def merged(sensor_host, light_mode: int, primary_fails: int) -> dict:
+    """Run one merged read and return the parsed result."""
+    line = run(sensor_host, "merge", str(light_mode), str(primary_fails))
+    parsed = {}
+    for part in line.strip().split(","):
+        if "=" in part:
+            key, value = part.split("=", 1)
+            parsed[key] = value
+    assert parsed, line
+    return parsed
+
+
+def test_light_present_gives_a_value_on_every_channel(sensor_host):
+    row = merged(sensor_host, light_mode=0, primary_fails=0)
+    assert row["rc"] == "0"
+    assert row["valid"][0] == "1", "temperature"
+    assert row["valid"][1] == "1", "humidity"
+    assert row["valid"][3] == "1", "light"
+    assert float(row["light"]) > 0.0
+
+
+def test_a_failed_light_sensor_does_not_fail_the_measurement(sensor_host):
+    """The whole point: light is optional, temperature and humidity are not."""
+    row = merged(sensor_host, light_mode=1, primary_fails=0)
+    assert row["rc"] == "0", "a missing light sensor must not fail the sample"
+    assert row["valid"][0] == "1", "temperature is still good"
+    assert row["valid"][1] == "1", "humidity is still good"
+    assert row["valid"][3] == "0", "only light is invalid"
+    assert float(row["light"]) == 0.0, "an invalid channel carries no value"
+
+
+def test_an_absent_light_sensor_behaves_the_same(sensor_host):
+    """Not attempted at all is not a different kind of failure for the caller."""
+    row = merged(sensor_host, light_mode=2, primary_fails=0)
+    assert row["rc"] == "0"
+    assert row["valid"][0] == "1"
+    assert row["valid"][1] == "1"
+    assert row["valid"][3] == "0"
+
+
+def test_a_failed_primary_measurement_fails_whole_sample(sensor_host):
+    """The asymmetry, from the other side: this one *does* take everything down."""
+    row = merged(sensor_host, light_mode=0, primary_fails=1)
+    assert row["rc"] == "-1"
+    assert row["valid"] == "0000", "no channel is valid when the primary failed"
+    assert float(row["temp"]) == 0.0
+    assert float(row["hum"]) == 0.0
+
+
+def test_light_failure_leaves_temperature_and_humidity_values_intact(sensor_host):
+    """Not just the flags: the numbers themselves must survive."""
+    good = merged(sensor_host, light_mode=0, primary_fails=0)
+    dark = merged(sensor_host, light_mode=1, primary_fails=0)
+    assert float(dark["temp"]) == float(good["temp"])
+    assert float(dark["hum"]) == float(good["hum"])

@@ -5,10 +5,26 @@
 - **MCU**: ESP32-S3 (documented target: ESP32-S3 N16R8 — 16 MB flash, 8 MB octal
   PSRAM; `sdkconfig.defaults` matches)
 - **Toolchain**: ESP-IDF v5.4, C
-- **Sensors**:
-  - BME280 — temperature / humidity / pressure over I2C (implemented)
-  - BH1750 — ambient light over I2C (**not implemented**; the light channel is
-    reported invalid, and the change detector excludes invalid channels)
+- **Sensors** (all on the one shared I2C bus, see `sensor_bus.c`):
+  - SHT30 / SHT3x — temperature / humidity (implemented; the default and the
+    backend this build is validated on)
+  - BME280 — temperature / humidity / pressure (implemented, optional backend)
+  - BH1750 / GY-302 — ambient light (implemented; an *optional channel*, not a
+    third backend — see below)
+
+Two different things are configured, and they are not interchangeable:
+
+| | configured by | provides |
+|---|---|---|
+| the primary environmental backend | `CONFIG_AS_SENSOR_BACKEND` (SHT30 or BME280) | temperature, humidity (+ pressure on a BME280) |
+| the optional light channel | `CONFIG_AS_USE_BH1750` | `light` |
+
+The light sensor adds a channel to whatever the primary backend measured; it never
+replaces it. On the physical build: SHT30 gives temperature and humidity, the
+BH1750 gives light, and `pressure` stays invalid because nothing on the board
+measures it. If the BH1750 is missing or fails, only `light` goes invalid and the
+measurement still succeeds — the change detector already excludes invalid
+channels, so nothing downstream has to know.
 - **Connectivity**: 2.4 GHz Wi-Fi + built-in esp-mqtt (MQTT 3.1.1)
 
 ## Wiring

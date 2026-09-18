@@ -161,6 +161,19 @@ firmware:
   # simulator replays stored signals and has no live sensor to lose.
   sensor_failures_before_unavailable: 3
 
+  # Optional light channel: a BH1750 / GY-302 on the same shared I2C bus as the
+  # primary backend. Firmware-only: the simulator replays stored signals and has
+  # no light sensor to read. This is deliberately not a third value of
+  # CONFIG_AS_SENSOR_BACKEND - the light sensor adds the `light` channel
+  # alongside the primary one, and its failure invalidates only that channel.
+  #
+  # meas_time_ms is the one-shot conversion wait (datasheet maximum at the
+  # default MTreg). One-shot is used rather than continuous mode because the node
+  # samples every 5-60 s and the board's 3.3 V rail stays up during light sleep.
+  use_bh1750: 1
+  bh1750_i2c_addr: 0x23
+  bh1750_meas_time_ms: 180
+
 
 # -------------------------------------------------------------
 # Evaluation configuration (metrics only, not used by the node)

@@ -965,6 +965,248 @@ core algorithm:  change_detector / adaptive_scheduler / simulator / analysis —
 
 ---
 
+## Session 7 — 2026-09-18, BH1750 light channel: driver, merge, and hardware
+
+The light channel was the one part of `sensor_read_t` that had never carried a real
+value: every payload went out with `"light": null` and `"valid": {"light": false}`.
+This session puts a BH1750 / GY-302 behind it — on the bus that already existed,
+without touching the primary sensor's role, the algorithm, or the payload schema.
+
+Board: ESP32-S3, I2C SDA=GPIO8 SCL=GPIO9, SHT30 at 0x44, BH1750 at 0x23. One bus,
+owned by `sensor_bus.c`; no second bus was created.
+
+### Architecture: an optional channel, not a third backend
+
+`CONFIG_AS_SENSOR_BACKEND` chooses which chip provides the *primary*
+environmental reading. The BH1750 was deliberately kept out of that choice: it
+does not replace the SHT30, it adds one channel to it.
+
+```
+shared I2C bus (sensor_bus.c)
+├── primary environmental backend   CONFIG_AS_SENSOR_BACKEND
+│   ├── SHT30 / SHT3x   temperature + humidity     <- this build
+│   └── BME280          temperature + humidity + pressure
+└── optional light channel          CONFIG_AS_USE_BH1750
+    └── BH1750 / GY-302 light
+```
+
+`sensor_read()` therefore does two things in order: read the primary backend, then
+merge the optional light channel into the same `sensor_read_t`. On this build that
+yields temperature and humidity from the SHT30, light from the BH1750, and
+pressure invalid because nothing on the board measures it.
+
+The BH1750 knows nothing about the change detector, the scheduler, MQTT or
+events: it turns I2C bytes into lux.
+
+### One-shot, not continuous — and why
+
+The driver uses One Time H-Resolution (`0x20`), not Continuous H-Resolution
+(`0x10`). The node samples every 5-60 s; continuous mode re-converts about every
+120 ms and draws measurement current the whole time, including while the ESP32 is
+in light sleep and the board's 3.3 V rail is still up — on the order of ten
+thousand conversions per sample, all but one discarded, in a project whose whole
+point is how much it sleeps.
+
+One-shot converts when asked and returns to power-down by itself. Its cost is a
+bounded wait: `CONFIG_AS_BH1750_MEAS_TIME_MS = 180`, the datasheet maximum at the
+default MTreg (typical 120 ms). That is at most 3.6 % of a 5 s interval and 0.3 %
+of a 60 s one. The wait is a single constant, never a poll-for-completion loop;
+every failure path returns -1. It is not claimed to be "the most efficient
+possible" — only that it matches the sampling model and does not spend current on
+measurements nobody reads.
+
+Conversion is `lux = raw / 1.2`, the datasheet factor for the default MTreg of 69.
+It is anchored to real light rather than taken on trust: in the first hardware
+session this very module answered with raw = 66, which is 55.0 lx, and the host
+test suite pins that value.
+
+### Failure semantics: light is optional, temperature is not
+
+| what failed | result |
+|---|---|
+| primary backend | `sensor_read()` returns -1, no channel valid |
+| light channel | `sensor_read()` returns **0**; only `light` is invalid |
+
+A node that exists to report temperature and humidity must not go dark because an
+optional channel went quiet. The light sensor also keeps its own small state
+(`available`, `consecutive_failures`, `next_probe_ms`) in `bh1750_proto.c` instead
+of joining `sensor_supervisor.c`: a BH1750 failure must never trigger a primary
+re-probe, and the two are verified separately below.
+
+Two consecutive failed readings declare it absent, after which it is probed once
+per `CONFIG_AS_MIN_INTERVAL_S` — a probe being simply an attempt at a measurement,
+since the part has no identity register worth reading. Recovery needs no restart.
+
+### Host tests
+
+26 new. `tests/test_bh1750.py` (20) covers the conversion at the boundaries
+(0, the module's reference 66, the register maximum 65535 -> 54612.5 lx), that it
+is finite, non-negative and monotonic, and the measurement over a fake transport:
+success, dark, maximum, failed command write, **short frame**, read error, and
+that the conversion wait is bounded and configurable. It also replays the
+availability policy: one failure tolerated, two declares it gone, no traffic at
+all during backoff, and recovery after the interval without a restart.
+
+`tests/test_sensor_contract.py` gained 6 merge tests, using a mock seam for the
+light channel: primary ok + light ok -> everything valid; primary ok + light
+failed or absent -> `rc == 0` with only `light` invalid; primary failed -> `rc ==
+-1` with nothing valid.
+
+Both groups were checked against the *old* behaviour, not just the new: mutating
+the driver so the light channel is always invalid fails 2 tests, and the merge
+tests fail as designed when the merge is removed.
+
+```
+pytest:          206 passed (was 181)
+config parity:   63/63 PASS (BH1750 parameters added to the firmware section)
+ESP-IDF build:   clean build, rc=0, 0 warnings, 0 errors
+image size:      905,152 B (0xdcfc0), +1,168 B over the previous build
+simulation:      dataset/ and results/ unchanged - the benchmark numbers did not move
+```
+
+### Hardware — one continuous capture, 62 cycles
+
+Boot, then normal running, then the light-response experiment, then the hot-plug
+test, all inside a single 20-minute capture (a second capture would have reset the
+board, which would invalidate the recovery claim).
+
+```
+[1174ms] I sensor: sensor backend ready: SHT30 (temperature + humidity)
+[1221ms] I bh1750: optional light channel enabled: BH1750 at 0x23
+                   (one-shot H-resolution, 180 ms conversion, re-probe every 5s)
+[1240ms] I main: sensor initialised after 1 attempt(s)
+cycle=1  lux=141.7
+```
+
+| | |
+|---|---|
+| total cycles | **62** |
+| light valid | **52** |
+| `light=na` | 10, all inside the deliberate unplug window |
+| negative lux / NaN / Inf | **0 / 0 / 0** |
+| above the register maximum (54612.5) | **0** |
+| lux range | 0.8 - 757.5 |
+| primary unavailable events | **0** |
+| panic / watchdog / reboot | **0 / 0 / 0** |
+
+A second, unattended 35-minute capture was then left running to accumulate reads
+and sleep statistics without anyone touching the board: **38 cycles, 38 light
+readings, 0 `light=na`, 0 primary failures, 0 reboots**. Across both captures that
+is 100 cycles and 90 valid light readings.
+
+No narrow "plausible lux range" is asserted: the check is for obvious nonsense
+(negative, NaN, out of range), not for what a room ought to look like.
+
+### Light response, and that it reaches the algorithm
+
+Three states, each held for at least two samples.
+
+```
+ambient      102.5 / 103.3 / 115.8 / 105.8 / 145.8 / 145.8 lx   state=STABLE  interval=60s
+covered        0.8 lx                                            score 1.15 -> 4.52
+                                                                 state STABLE -> ACTIVE
+                                                                 interval 60 -> 15 -> 10 -> 5s
+flashlight   382.5 / 410.8 ... peak 757.5 lx                     score -> 11.08
+                                                                 state ACTIVE, interval 15s
+```
+
+The point is not that a number moved. The same capture shows the chain: the light
+channel changed, the score responded (1.15 -> 4.52 -> 11.08), the state changed
+(STABLE -> ACTIVE) and the interval ladder reacted (60 -> 15 -> 10 -> 5 s), with
+upload decisions following. Once the new level held, the score decayed
+(4.52 -> 2.27 -> 1.82 -> 1.56 -> 1.44 -> 1.33 -> 1.00 -> 0.75) and the interval
+climbed back (5 -> 20 -> 40 -> 60 s), which is the intended behaviour rather than
+a stuck alarm.
+
+No algorithm parameter was touched: `noise_floor_light`, the thresholds, the
+ladder and the upload policy are unchanged. The existing parameters were simply
+given a real channel to work on.
+
+### MQTT and the collector
+
+The payload schema was not changed, and neither was the collector's CSV — the
+`light` column and the `valid` map already existed. What changed is what arrives
+in them.
+
+```
+temperature=25.07  humidity=56.94  light=152.5  (pressure empty)
+valid = {"humidity":true,"light":true,"pressure":false,"temperature":true}
+```
+
+Cross-checked cycle by cycle against the serial log, over the last boot segment of
+the CSV (37 rows, uptime 20.2 s - 1259.6 s):
+
+| | |
+|---|---|
+| samples correlated | 36 |
+| lux mismatches | **0** |
+| `valid` map anomalies | **0** |
+| rows with `light` non-null | **34 / 37** (the 3 nulls are the unplug window) |
+| `publish_call_ok=1` vs collector rows | 36 vs 37 |
+
+The difference of one is explained rather than waved away: the last collector row
+is timestamped 1259.6 s, after this capture ended at ~1200 s, so it is a publish
+the node made after the serial capture stopped.
+
+### Hot-plug: light only, and it comes back by itself
+
+BH1750 unplugged for about 2.5 minutes while the node ran:
+
+```
+cycle 43-52   light=na    temperature 25.0-25.2, humidity 56.3-57.1  (normal)
+              adaptive sampling continued: interval 5 -> 20 -> 40 s
+sensor became unavailable   0     <- the primary supervisor was never involved
+sensor init failed          0     <- no primary re-probe, no teardown
+no reading at cycle         0     <- the primary measurement never failed
+panic / watchdog / reboot   0
+```
+
+Plugged back in, no restart:
+
+```
+cycle 53   lux=45.8    <- first successful re-probe
+cycle 54   lux=140.8
+cycle 55+  lux=151.7 / 152.5 / 152.5 ...
+```
+
+So: an absent light sensor costs exactly one channel, and it comes back on its own.
+
+### Power regression
+
+Automatic light sleep still happens. Measured over a clean, unattended window
+with the BH1750 in the loop:
+
+| | scheduled_idle_s | light_sleep_s | ratio |
+|---|---|---|---|
+| before the BH1750 (session 5) | 1026.6 | 835.4 | 81.4 % |
+| with the BH1750 (this session) | **1614.0** | **1251.8** | **77.6 %** |
+
+`light_sleep_entries` grew monotonically across the window (5 277 -> 13 217 ->
+21 272), which is the counter that would stop moving if something were holding the
+chip awake.
+
+`light_sleep_s` is nowhere near 0, so there is no regression of the kind that
+would matter — no busy loop, no background task spinning, no polling that keeps
+waking the chip. The logs stay quiet (170 lines over the whole window, and no
+BH1750 error or warning at all). The few percentage points of difference are not
+attributed to anything in particular here: the two runs were on different days
+with different Wi-Fi conditions, so this is a check for obvious degradation, not
+a measurement of the BH1750's own cost. Measuring that would need a current
+measurement, which was not taken.
+
+### Not done in this session
+
+* **No current measurement.** The sleep ratio above is a software counter, not
+  power. The BH1750's own contribution is therefore *not measured*, only bounded
+  by "sleep still happens".
+* OLED, soil moisture, SNTP, pending-publish buffering, Wi-Fi backoff, BME280 on
+  hardware, deep sleep: all untouched, all still out of scope.
+* The simulator's light channel and the physical one remain different things:
+  nothing here is evidence about the published detection rates, which come from
+  synthetic signals.
+
+---
+
 ## Method notes
 
 Two things were needed to test at all from a scripted session, and both are

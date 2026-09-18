@@ -245,14 +245,25 @@ void app_main(void)
             power_set_phase(PM_ACTIVE);
         }
 
+        /* `light=na` rather than `light=0.0` when the channel is invalid: a real
+         * 0 lx reading and "no reading" must not look the same in the log, for
+         * the same reason the payload sends null. */
+        char light_str[16];
+        if (g_valid[SEN_CH_LIGHT]) {
+            snprintf(light_str, sizeof(light_str), "%.1f",
+                     (double)g_values[SEN_CH_LIGHT]);
+        } else {
+            snprintf(light_str, sizeof(light_str), "na");
+        }
+
         ESP_LOGI(TAG,
                  "cycle=%lu t=%.1f state=%d interval=%.1fs score=%.2f "
                  "event=%d upload_requested=%d publish_call_ok=%d "
-                 "temp=%.2f hum=%.2f",
+                 "temp=%.2f hum=%.2f light=%s",
                  cycle, t_sample, (int)decision.state, decision.interval_s,
                  (double)score, (int)decision.detected_event,
                  (int)decision.upload_requested, (int)publish_call_ok,
-                 (double)g_values[0], (double)g_values[1]);
+                 (double)g_values[0], (double)g_values[1], light_str);
 
         /* ---- DETERMINE NEXT WAKE ---------------------------------------- */
         next_wake = t_sample + (double)decision.interval_s;

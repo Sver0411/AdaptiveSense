@@ -169,26 +169,28 @@ dead broker diagnosable.
   "timestamp": 1234567890,
   "temperature": 24.10,
   "humidity": 45.20,
-  "pressure": 1012.30,
-  "light": null,
+  "pressure": null,
+  "light": 152.50,
   "sampling_interval": 60.0,
   "state": "STABLE",
   "event": false,
   "valid": {
     "temperature": true,
     "humidity": true,
-    "pressure": true,
-    "light": false
+    "pressure": false,
+    "light": true
   }
 }
 ```
 
-That example is from an SHT30 build; a BME280 build reports a real `pressure`
-instead of `null`. Two details carry meaning:
+That example is the physical build: an SHT30 for temperature and humidity, a
+BH1750 for light, and no pressure sensor on the board. Two details carry meaning:
 
-- **`null` for an unavailable channel.** An SHT30 has no pressure sensor and this
-  build has no light sensor, so both are `null` rather than `0`. A `0` would be
-  indistinguishable from a genuine reading of zero.
+- **`null` for an unavailable channel.** `pressure` has no device behind it and is
+  `null` rather than `0`; a `0` would be indistinguishable from a genuine reading
+  of zero. `light` is a number here because a BH1750 is fitted — if it is absent
+  or fails, `light` goes back to `null` while temperature and humidity keep being
+  reported, because the light channel is optional.
 - **The `valid` map is always present**, so a consumer never has to infer which
   channels the running configuration can actually measure.
 

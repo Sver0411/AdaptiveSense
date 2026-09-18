@@ -79,7 +79,7 @@ flowchart LR
 
 | layer | file | responsibility |
 |-------|------|----------------|
-| sensor | `sensor.c`, `sensor_backend.h`, `sensor_bus.c`, `sensor_supervisor.c`, `sensor_sht30.c`, `sht30_proto.c`, `sensor_bme280.c`, `bme280_math.c` | sensor API and backend selection, shared I2C bus ownership, bring-up and recovery supervision, two chip backends (SHT30 / BME280) |
+| sensor | `sensor.c`, `sensor_backend.h`, `sensor_bus.c`, `sensor_supervisor.c`, `sensor_sht30.c`, `sht30_proto.c`, `sensor_bme280.c`, `bme280_math.c`, `sensor_bh1750.c`, `bh1750_proto.c` | sensor API and backend selection, shared I2C bus ownership, bring-up and recovery supervision, two chip backends (SHT30 / BME280) plus the optional light channel |
 | change detection | `change_detector.c` | normalised instability score + debounced event |
 | adaptive policy | `adaptive_scheduler.c` | state machine, interval ladder, upload decision |
 | communication | `communication.c`, `communication_payload.c` | Wi-Fi lifecycle, MQTT publish, payload format, publish counters |
@@ -99,6 +99,8 @@ The sensor layer in detail — one abstraction, two backends:
 | `sht30_proto.c` | SHT30 protocol in pure C: CRC-8, frame decoding, command sequencing |
 | `sensor_bme280.c` | BME280 backend: chip-id check, forced-mode register sequence |
 | `bme280_math.c` | BME280 calibration parsing and compensation maths (pure C) |
+| `sensor_bh1750.c` | optional light channel: BH1750 on the shared bus, its own small availability state |
+| `bh1750_proto.c` | BH1750 protocol in pure C: one-shot conversion, raw -> lux, and the availability policy |
 
 The layers have no back-references to each other, and the policy holds no
 reference to any sensor or radio driver — which is what lets the same C files be
@@ -159,11 +161,21 @@ tuning value is hardcoded in any source file.
   reports the channels it cannot measure as *invalid* and the detector already
   ignores invalid channels. The physical build validated here runs an SHT30; the
   published simulation results are unaffected by the choice.
-- **No light sensor driver ships.** The synthetic benchmark includes a light
-  channel to exercise multi-modal behaviour, but the firmware reports it invalid
-  and the MQTT payload sends `"light": null` plus an explicit `valid` map rather
-  than a plausible `0`. The same applies to `pressure` on an SHT30 build. A BH1750
-  driver is a future hardware extension.
+- **The light channel is real on hardware, and is optional.** A BH1750 / GY-302
+  on the shared bus provides `light`; on the physical build the SHT30 supplies
+  temperature and humidity, the BH1750 supplies light, and `pressure` stays
+  invalid because nothing on the board measures it. It is an *optional* channel,
+  not a third backend: if the light sensor fails or is unplugged only `light`
+  goes invalid and the measurement still succeeds, because a node that reports
+  temperature and humidity must not go dark over a channel it can do without.
+  An unavailable channel is still sent as `null` with an explicit `valid` map
+  rather than as a plausible `0`.
+- **The simulation light channel and the physical one are different things.** The
+  synthetic benchmark's light channel is generated signal, replayed by the
+  simulator; the numbers in [Simulation results](#simulation-results) say nothing
+  about the BH1750 and are not evidence for or against it. What the hardware
+  validates is that a real light channel reaches the detector and that the policy
+  reacts to it — not that the published detection rates hold on this sensor.
 
 ## Experimental design
 
@@ -300,12 +312,12 @@ required of the **numeric** outputs only, and CI enforces that.
 | Python / C policy parity | **Verified** — firmware policy sources compiled for the host and compared sample by sample |
 | Synthetic evaluation | **Verified** — numeric outputs reproduce byte for byte |
 | Power-management configuration | **Verified in the build** — `CONFIG_PM_ENABLE=y`, tickless idle, light-sleep callbacks; the active sleep mode is logged at boot |
-| **ESP32-S3 physical flash / run** | `Not measured yet.` |
-| **BME280 physical sensor validation** | `Not measured yet.` |
-| **Wi-Fi / MQTT multi-cycle hardware run** | `Not measured yet.` |
+| **ESP32-S3 physical flash / run** | **Verified** — see `docs/hardware_test_log.md` (sessions 1-7) |
+| **BME280 physical sensor validation** | `Not measured yet.` — no BME280 is fitted to the board; the driver is host-tested and the chip-id check is written, but it has never seen the part |
+| **Wi-Fi / MQTT multi-cycle hardware run** | **Verified** — multi-cycle runs over a phone hotspot with a local broker; node publishes cross-checked against the collector |
 | **Power measurement** | `Not measured yet.` — no INA219 / Joulescope / Power Profiler run |
 | Sensor layer, both backends | **Verified** — host-tested protocol layer, and the SHT30 read on hardware (see the test log) |
-| BH1750 light sensor | **Not implemented**; the channel is reported invalid and sent as `null` |
+| BH1750 light sensor | **Verified** — real lux on the shared bus; an optional channel, so its failure invalidates only `light` |
 | Deep sleep | **Experimental, rejected at compile time** — it reboots, so the scheduling state would not survive |
 
 The firmware logs the policy decision (`upload_requested`) and the transport
@@ -384,7 +396,9 @@ numeric results are exactly what the pipeline produces. CI enforces this with
   the ladders, with the coupling above treated explicitly.
 - **Delivery confirmation** via QoS 1 + `MQTT_EVENT_PUBLISHED` + server-side
   receipt validation.
-- **BH1750 support**, and with it a real multi-modal on-device build.
+- ~~BH1750 support~~ — done: the light channel is real on hardware (session 7),
+  so the on-device build is already multi-modal. What remains is a BME280 build,
+  which needs the part on the board.
 - **Comparison against advanced adaptive sampling / change-point detection**, and
   the exploratory directions (a TinyML predictor, LoRa transport, multi-node
   correlation). *None of these are implemented here.*

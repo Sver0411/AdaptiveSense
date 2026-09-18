@@ -25,6 +25,8 @@ idf_component_register(
         "sensor_bme280.c"
         "sensor_sht30.c"
         "sht30_proto.c"
+        "sensor_bh1750.c"
+        "bh1750_proto.c"
         "sensor_supervisor.c"
         "bme280_math.c"
         "change_detector.c"

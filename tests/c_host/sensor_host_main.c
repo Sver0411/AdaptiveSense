@@ -27,6 +27,10 @@
  *       cycle, and print the counters it produced. This is what pins the rule that
  *       the counters only move for a read that was actually attempted.
  *
+ *   merge <light_mode> <primary_fails>
+ *       Exercise the optional light channel's merge rules: a failed light sensor
+ *       must invalidate only `light`, while a failed primary invalidates all.
+ *
  *   supervisor <retry_interval_s> <t1,t2,t3,...>
  *       Drive sensor_supervisor_t: the first attempt is made at t=0 (and fails),
  *       then each probe time is queried and, when the policy allows an attempt, a
@@ -238,6 +242,53 @@ static int cmd_contract_init_fail(void)
 }
 
 /*
+ * The channel-merge rules, which are the whole point of the optional light
+ * channel.
+ *
+ *   merge <light_mode> <primary_fails>
+ *
+ *   light_mode     0 present and measuring, 1 attempted and failed, 2 absent
+ *   primary_fails  0 the primary backend reads fine, 1 it fails
+ *
+ * Prints one line:
+ *
+ *   merge,rc=<n>,valid=<temp><hum><press><light>,temp=<v>,hum=<v>,light=<v>
+ *
+ * The three cases that matter:
+ *
+ *   primary ok + light ok      everything valid, rc=0
+ *   primary ok + light failed  temperature and humidity valid, light invalid,
+ *                              and rc is still 0 - a missing light sensor must
+ *                              not fail the measurement
+ *   primary failed             rc=-1 and nothing is valid
+ */
+static int cmd_merge(int argc, char **argv)
+{
+    if (argc < 4) {
+        fprintf(stderr, "usage: merge <light_mode> <primary_fails>\n");
+        return 2;
+    }
+    const int light_mode = atoi(argv[2]);
+    const int primary_fails = atoi(argv[3]);
+
+    if (sensor_init() != 0) {
+        printf("merge,rc=-2,valid=0000,temp=0,hum=0,light=0\n");
+        return 0;
+    }
+    sensor_mock_set_bh1750(light_mode);
+    sensor_mock_set_read_failure(primary_fails != 0);
+
+    sensor_read_t r;
+    const int rc = sensor_read(&r);
+    printf("merge,rc=%d,valid=%d%d%d%d,temp=%.4f,hum=%.4f,light=%.4f\n",
+           rc, (int)r.valid[SEN_CH_TEMPERATURE], (int)r.valid[SEN_CH_HUMIDITY],
+           (int)r.valid[SEN_CH_PRESSURE], (int)r.valid[SEN_CH_LIGHT],
+           (double)r.value[SEN_CH_TEMPERATURE], (double)r.value[SEN_CH_HUMIDITY],
+           (double)r.value[SEN_CH_LIGHT]);
+    return 0;
+}
+
+/*
  * Replay the sampling loop the way main.c runs it.
  *
  *   cycles <retry_interval_s> <failures_before_unavailable> <n_cycles>
@@ -360,6 +411,9 @@ int main(int argc, char **argv)
     }
     if (strcmp(argv[1], "sensor-after-init") == 0) {
         return cmd_sensor_after_init();
+    }
+    if (strcmp(argv[1], "merge") == 0) {
+        return cmd_merge(argc, argv);
     }
     if (strcmp(argv[1], "supervisor") == 0) {
         return cmd_supervisor(argc, argv);
