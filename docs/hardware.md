@@ -186,6 +186,26 @@ result in a 22-fractional-bit accumulator which an earlier revision of this
 project divided by 1024 instead of 4096, reporting humidity four thousand times
 too large. See [audit_v0.2.md](audit_v0.2.md), issues #1 and #1b.
 
+## Runtime bus wedge — a known limitation
+
+`sensor_bus.c` can release a wedged bus: it samples SDA/SCL as inputs and, if a
+line is held low, clocks SCL at least nine times and issues a STOP. A wedge was
+observed once on this board and that procedure released it
+(`docs/hardware_test_log.md`, session 3).
+
+**But that recovery only runs when the bus does not exist yet** — at boot, or
+after a failed bus creation. The shared bus is created once and deliberately kept
+for the life of the node, so a slave that wedges SDA/SCL *while the node is
+running* is not covered by it: neither a primary sensor re-init nor a BH1750
+re-probe reaches the recovery code, because neither re-creates the bus.
+
+This is recorded as a limitation, not fixed. Clocking the lines while several
+devices share them is easy to get wrong (a device mid-transaction can be left in
+a worse state), so it needs its own justification and its own test: a deliberate
+injection that holds SDA low at runtime, followed by an observed automatic
+recovery. That test has not been run, and no automatic runtime recovery is
+claimed.
+
 ## Mock sensor (no hardware required)
 
 With `CONFIG_AS_USE_MOCK_SENSOR = 1`, `sensor_read()` returns a deterministic

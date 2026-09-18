@@ -1016,9 +1016,12 @@ possible" — only that it matches the sampling model and does not spend current
 measurements nobody reads.
 
 Conversion is `lux = raw / 1.2`, the datasheet factor for the default MTreg of 69.
-It is anchored to real light rather than taken on trust: in the first hardware
-session this very module answered with raw = 66, which is 55.0 lx, and the host
-test suite pins that value.
+The factor is the datasheet formula, not a fitted constant, and one hardware
+observation is consistent with it: in the first hardware session this very module
+returned raw = 66, which the formula turns into 55.0 lx - plausible for the
+conditions observed, and the host test suite pins that value. That is a sanity
+check against a plausible reading, not a calibration; no independent lux meter
+was used.
 
 ### Failure semantics: light is optional, temperature is not
 
@@ -1033,9 +1036,11 @@ optional channel went quiet. The light sensor also keeps its own small state
 of joining `sensor_supervisor.c`: a BH1750 failure must never trigger a primary
 re-probe, and the two are verified separately below.
 
-Two consecutive failed readings declare it absent, after which it is probed once
-per `CONFIG_AS_MIN_INTERVAL_S` — a probe being simply an attempt at a measurement,
-since the part has no identity register worth reading. Recovery needs no restart.
+Two consecutive failed readings declare it absent, after which it is re-probed no
+sooner than `CONFIG_AS_MIN_INTERVAL_S` later - and only on the node's normal
+sampling cadence, since the policy is consulted when the main loop takes a sample.
+A re-probe is simply an attempt at a measurement: the part has no identity register
+worth reading. Recovery needs no restart.
 
 ### Host tests
 
@@ -1073,7 +1078,8 @@ board, which would invalidate the recovery claim).
 ```
 [1174ms] I sensor: sensor backend ready: SHT30 (temperature + humidity)
 [1221ms] I bh1750: optional light channel enabled: BH1750 at 0x23
-                   (one-shot H-resolution, 180 ms conversion, re-probe every 5s)
+                   (one-shot H-resolution, 180 ms conversion; re-probe backoff
+                    >= 5s, checked on sensor samples)
 [1240ms] I main: sensor initialised after 1 attempt(s)
 cycle=1  lux=141.7
 ```

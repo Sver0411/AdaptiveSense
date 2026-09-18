@@ -109,11 +109,15 @@ neither can drift silently. Do not quote one as the other.
 | `estimated_payload_bytes` | uploads × the measured size of one payload |
 | `upload_energy_proxy` | uploads × a configured dimensionless constant |
 
-`payload_bytes_per_upload` is a measurement, not a guess: 246 bytes is what the
-firmware's own payload builder produces for the shipped build, and
-`tests/test_communication_payload.py` re-measures it. The true length varies with
-the number of digits in the readings, so the constant is representative rather than
-exact.
+`payload_bytes_per_upload` is a **representative application payload size**, not an
+exact wire length: 244 bytes is what the firmware's own payload builder produces
+for the shipped build (SHT30 + BH1750, normal indoor readings, a 10-digit
+millisecond timestamp), and `tests/test_communication_payload.py` re-measures it
+from the same source. Real payloads move in a narrow band around it — 242-247
+bytes across dark, indoor, bright and large-lux readings, and a wider timestamp —
+because the JSON is free-form and its length follows the digits in the values. The
+constant is good enough to compare strategies against each other; it is not good
+enough for a byte-exact radio-energy claim, which is not made.
 
 No physical energy unit is reported.
 

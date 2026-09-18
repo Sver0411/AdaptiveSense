@@ -11,10 +11,12 @@
  * The bus itself is owned by sensor_bus.c and shared with every other device on
  * those two wires, so this backend never creates or deletes one.
  *
- * Channels: temperature and humidity only. SHT30 has no pressure sensor and this
- * project has no light sensor driver, so those two channels are left invalid —
- * `sensor.c` has already marked every channel invalid before calling read(), so
- * the backend only has to fill in what it actually measured.
+ * Channels: temperature and humidity only. The SHT30 itself has neither a
+ * pressure channel nor a light channel, so both are left invalid here; if the
+ * optional BH1750 is fitted, `sensor.c` merges its reading into the light channel
+ * after this backend returns (see sensor_bh1750.c). `sensor.c` has already marked
+ * every channel invalid before calling read(), so the backend only has to fill in
+ * what it actually measured.
  */
 #include <string.h>
 
@@ -147,7 +149,8 @@ static int sht30_read(sensor_read_t *out)
     out->value[SEN_CH_HUMIDITY] = humidity_pct;
     out->valid[SEN_CH_HUMIDITY] = true;
 
-    /* No pressure sensor on this part, and no light sensor in this build. */
+    /* This part measures only temperature and humidity; pressure has no device
+     * behind it, and light, when a BH1750 is fitted, is merged by sensor.c. */
     out->valid[SEN_CH_PRESSURE] = false;
     out->valid[SEN_CH_LIGHT] = false;
     return 0;

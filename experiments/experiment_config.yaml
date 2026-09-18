@@ -115,26 +115,31 @@ adaptive:
   # Communication cost bookkeeping.
   # These are PROXY constants. No physical energy unit is claimed.
   energy:
-    # Size of one MQTT payload as produced by the firmware's own builder
-    # (firmware/main/communication_payload.c), for the shipped configuration and
-    # a 10-digit millisecond timestamp.
+    # REPRESENTATIVE application payload size, measured with the firmware's own
+    # payload builder (firmware/main/communication_payload.c) for the shipped
+    # configuration: SHT30 + optional BH1750, normal indoor readings, and a
+    # 10-digit millisecond timestamp.
     #
-    # It depends on which sensor backend is selected, because a backend reports
-    # the channels it cannot measure as invalid and an invalid channel is sent as
-    # JSON `null`:
+    # This is NOT an exact wire length. The JSON is free-form, so its size moves
+    # with the digits in the readings and in the timestamp:
     #
-    #   CONFIG_AS_SENSOR_BACKEND=1 (BME280)  pressure valid   -> 246 bytes
-    #   CONFIG_AS_SENSOR_BACKEND=2 (SHT30)   pressure invalid -> 244 bytes
+    #   dark / low lux        lux=8.3      -> 242 bytes
+    #   normal indoor         lux=141.7    -> 244 bytes   <- the value below
+    #   bright                lux=757.5    -> 244 bytes
+    #   very large lux        lux=12345.6  -> 246 bytes
+    #   a 13-digit timestamp  ...          -> 247 bytes
     #
-    # 244 bytes is the size for a TEN-DIGIT millisecond timestamp. The firmware
-    # currently sends milliseconds SINCE BOOT, which is 5-6 digits early in a
-    # session, so a real payload measures 238-240 bytes on the wire (observed).
-    # The constant is a representative upper size, not an exact wire length; see
-    # docs/hardware_test_log.md, session 4, open item 2.
+    # That band is narrow (the host test pins it), which is why a single
+    # representative number is good enough for `estimated_payload_bytes` and for
+    # comparing strategies against each other. It would not be good enough for a
+    # byte-exact radio-energy claim, which is not made: see
+    # `upload_energy_units_per_upload` below and docs/change_score_spec.md.
     #
-    # The value below matches the selected backend, and
-    # tests/test_communication_payload.py derives the expected form from the same
-    # configuration, so the two cannot drift apart.
+    # Which channels are valid is a property of the configuration, and an invalid
+    # channel is sent as JSON `null`, so the length depends on it too. The
+    # expected validity mask is derived from config.example.h by
+    # tests/test_communication_payload.py (currently 1101: temperature, humidity
+    # and light valid, pressure invalid), so the two cannot drift apart.
     payload_bytes_per_upload: 244
     upload_energy_units_per_upload: 1.0   # dimensionless proxy
 

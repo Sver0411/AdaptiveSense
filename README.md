@@ -362,25 +362,31 @@ numeric results are exactly what the pipeline produces. CI enforces this with
    channel-level labels over 26 400 s is a small benchmark.
 2. **One environment family and a single node.** Indoor-like temperature,
    humidity, pressure and light; generalisation is untested.
-3. **Limited sensor modalities.** Three channels are modelled; only two
-   (temperature, humidity) are enabled by default, pressure is disabled and the
-   light channel has no driver.
+3. **Physical modalities cover temperature, humidity and light.** The board
+   carries an SHT30 and a BH1750; `pressure` is not validated on hardware because
+   no BME280 is fitted, so the driver is host-tested only. The simulator still
+   models all three synthetic channels independently of what the board has.
 4. **No hardware energy measurement.** All cost figures are counts and a
    dimensionless proxy.
-5. **A change-aware policy cannot react before a change has been sampled.** If no
+5. **A runtime I2C bus wedge has no automatic recovery.** The bus-recovery
+   procedure in `sensor_bus.c` runs only when the bus is created (boot), not
+   mid-run; a slave that holds SDA/SCL low while the node is running would need a
+   re-probe cycle that has not been designed or tested. Observed once and released
+   by hand; see `docs/hardware.md`.
+6. **A change-aware policy cannot react before a change has been sampled.** If no
    sample lands inside a short event, nothing that relies on sampled observations
    alone can detect it (scenario E).
-6. **Parameters are hand-selected and known not to be jointly optimal.**
+7. **Parameters are hand-selected and known not to be jointly optimal.**
    `event_min_duration_s` (10 s) is not comfortably smaller than `baseline_tau_s`
    (60 s), so a step observed at a 60 s interval cannot satisfy the debounce before
    the deviation decays (scenario C). The values were left as they were configured
    rather than tuned to improve the published numbers.
-7. **No comparison against more advanced adaptive-sampling algorithms**
+8. **No comparison against more advanced adaptive-sampling algorithms**
    (change-point detection, Bayesian or information-theoretic schemes,
    learning-based predictors).
-8. **"Detection" means the score crossed a threshold for long enough**, not that a
+9. **"Detection" means the score crossed a threshold for long enough**, not that a
    change point was located: the detector is a threshold-and-debounce rule.
-9. **`publish_call_ok` is not delivery confirmation.** It reports that the MQTT
+10. **`publish_call_ok` is not delivery confirmation.** It reports that the MQTT
    client accepted the request (QoS 0). End-to-end confirmation would need QoS 1,
    `MQTT_EVENT_PUBLISHED` and server-side receipt validation.
 

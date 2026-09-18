@@ -138,7 +138,16 @@ i2c_master_bus_handle_t sensor_bus_acquire(void)
     }
 
     /* Before the driver claims the pins: a wedged bus must be released, or every
-     * transfer below fails and no amount of retrying helps. */
+     * transfer below fails and no amount of retrying helps.
+     *
+     * Known boundary, recorded rather than claimed away: this recovery runs only
+     * here, i.e. when the bus does not exist yet — at boot, or after a failed
+     * creation. A slave that wedges the bus *while the node is running* is not
+     * covered: the shared bus is created once and kept, so neither a primary
+     * sensor re-init nor a BH1750 retry reaches this code. Untested on purpose
+     * for this round; clocking the lines mid-run while other devices share them
+     * needs its own justification and test. See docs/hardware.md, "Runtime bus
+     * wedge". */
     bus_recover_lines();
 
     const i2c_master_bus_config_t bus_config = {

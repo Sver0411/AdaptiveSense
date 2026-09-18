@@ -7,12 +7,14 @@
  *
  * Why a per-channel validity map
  * ------------------------------
- * The physical firmware build implements a BME280 only; the light channel has no
- * sensor behind it. Reporting `"light": 0` would be indistinguishable from a
- * genuinely dark room, so an unavailable channel is sent as JSON `null` and the
- * payload additionally carries an explicit `valid` map. A consumer can therefore
- * tell "the value is 0" from "there is no value" without knowing which sensors
- * this build has.
+ * Which channels carry a value depends on what the build's sensors can measure
+ * (see sensor.h): an SHT30 provides temperature and humidity, an optional BH1750
+ * provides light, and pressure has nothing behind it on an SHT30 build. Reporting
+ * a missing channel as `0` would be indistinguishable from a genuine reading of
+ * zero, so an unavailable channel is sent as JSON `null` and the payload
+ * additionally carries an explicit `valid` map. A consumer can therefore tell
+ * "the value is 0" from "there is no value" without knowing which sensors this
+ * build has.
  */
 #ifndef ADAPTIVESENSE_COMMUNICATION_PAYLOAD_H
 #define ADAPTIVESENSE_COMMUNICATION_PAYLOAD_H

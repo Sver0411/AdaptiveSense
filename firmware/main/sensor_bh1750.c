@@ -111,8 +111,17 @@ void sensor_bh1750_init(void)
                       (unsigned long)CONFIG_AS_MIN_INTERVAL_S * 1000UL,
                       now_ms());
     s_armed = true;
+    /*
+     * The backoff is a *minimum*, not a rate: the policy is only consulted when
+     * the main loop takes a sample, so with the node sampling every 60 s an
+     * absent light sensor is re-probed on the next sample after the backoff
+     * elapses, not on a 5 s timer. Following the normal sampling cadence is the
+     * point — a re-probe is an attempt at a measurement, and there is nothing to
+     * gain from a dedicated task that would keep the chip awake to run it.
+     */
     ESP_LOGI(TAG, "optional light channel enabled: BH1750 at 0x%02x "
-                  "(one-shot H-resolution, %u ms conversion, re-probe every %us)",
+                  "(one-shot H-resolution, %u ms conversion; re-probe backoff "
+                  ">= %us, checked on sensor samples)",
              (unsigned)CONFIG_AS_BH1750_I2C_ADDR,
              (unsigned)CONFIG_AS_BH1750_MEAS_TIME_MS,
              (unsigned)CONFIG_AS_MIN_INTERVAL_S);

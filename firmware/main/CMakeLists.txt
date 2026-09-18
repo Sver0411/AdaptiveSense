@@ -34,6 +34,7 @@ idf_component_register(
         "communication.c"
         "communication_payload.c"
         "power_mgmt.c"
+        "power_stats.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_wifi

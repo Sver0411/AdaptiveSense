@@ -72,9 +72,13 @@ extern "C" {
  * conversion factor, not a fitted constant. With a non-default MTreg the result
  * scales by 69 / MTreg; this driver never changes MTreg, so the factor is fixed.
  *
- * Confirmed against the physical module before the driver was written: in the
- * first hardware session the part answered with raw = 66, which is 55.0 lx — a
- * plausible indoor value, and one that only comes out right with this factor.
+ * Where this factor is verified from, and how far that goes: it is the
+ * datasheet's formula, not a fitted constant. One hardware observation is
+ * consistent with it — in the first hardware session the part returned raw = 66,
+ * which this formula turns into 55.0 lx, plausible for the indoor conditions
+ * observed. That is a sanity check against a plausible reading, not a
+ * calibration: no independent lux meter or calibrated reference instrument was
+ * used, and none is claimed.
  */
 #define BH1750_LUX_DIVISOR      1.2f
 
@@ -170,9 +174,17 @@ void bh1750_state_init(bh1750_state_t *s, unsigned long probe_interval_ms,
  * Should a measurement be attempted at `now_ms`?
  *
  * True while the sensor is believed present, and — once it has been declared
- * gone — only when the re-probe interval has elapsed. A "probe" is simply an
+ * gone — only when the backoff interval has elapsed. A "probe" is simply an
  * attempt at a measurement: this part has no identity register worth reading, so
  * the cheapest way to find out whether it is back is to ask it for a value.
+ *
+ * Note what this does *not* promise: it is a minimum backoff, not a timer. The
+ * caller decides when to ask, and in this firmware that is on the node's normal
+ * sampling cadence — so with the node sampling every 60 s, an absent light sensor
+ * is re-probed on the first sample after the backoff elapses, which may be much
+ * later than the backoff itself. That is deliberate: re-probing is an I2C
+ * transaction, and running it from its own task would keep the chip awake for a
+ * channel that is optional.
  */
 bool bh1750_should_attempt(const bh1750_state_t *s, unsigned long now_ms);
 

@@ -38,12 +38,29 @@
  * ---------------------------------
  * `power_get_stats()` reports only quantities the firmware can actually observe:
  *
- *   sleep_requests        how often the loop entered its idle phase
- *   scheduled_idle_s      the summed duration it asked to be idle for
- *   light_sleep_entries   how often the chip really entered light sleep
- *                         (counted by a PM callback, CONFIG_PM_LIGHT_SLEEP_CALLBACKS)
- *   light_sleep_us        the summed **actual** light-sleep time, taken from the
- *                         callback's exit value
+ *   sleep_requests          how often the loop entered its idle phase
+ *   scheduled_idle_s        the summed duration it asked to be idle for
+ *   light_sleep_entries     how often the chip really entered light sleep,
+ *                           in ANY phase (PM callback,
+ *                           CONFIG_PM_LIGHT_SLEEP_CALLBACKS)
+ *   light_sleep_s           the summed **actual** light-sleep time, total
+ *   idle_light_sleep_entries / idle_light_sleep_s
+ *                           the subset of the above that happened while the duty
+ *                           cycle was in its PM_SLEEP phase
+ *
+ * Why the split matters. The PM callback fires for *every* automatic light sleep,
+ * and the chip can enter one during any `vTaskDelay()` — not only the main loop's
+ * scheduled idle. The BH1750's one-shot conversion, for example, waits ~180 ms
+ * inside `vTaskDelay()`, and the chip may well sleep through part of that. So
+ * `light_sleep_s` (total) counts sleep wherever it happened, while
+ * `idle_light_sleep_s` counts only sleep inside the scheduled idle window, which
+ * is the quantity `idle_light_sleep_s / scheduled_idle_s` means. Dividing the
+ * total by the scheduled idle instead would attribute other phases' sleep to the
+ * idle window and could exceed 100 %.
+ *
+ * `idle_light_sleep_s <= light_sleep_s` holds by construction: every sleep that
+ * reaches the idle counters reaches the totals too. The accounting rule lives in
+ * `power_stats.c` (pure C99) so it can be tested on a host rather than trusted.
  *
  * There is no "energy" field and no joule or millijoule figure: nothing in this
  * firmware can measure current. Real energy requires an external monitor
@@ -71,13 +88,19 @@ typedef enum {
     PM_SLEEP_AUTO_LIGHT = 1 /* vTaskDelay + ESP-IDF automatic light sleep */
 } pm_sleep_mode_t;
 
-/* Duty-cycle statistics. Every field is an observation, not a model. */
+/* Duty-cycle statistics. Every field is an observation, not a model.
+ *
+ * `light_sleep_*` is the TOTAL automatic light sleep, in whatever phase it
+ * happened; `idle_light_sleep_*` is the subset inside the scheduled idle window
+ * (PM_SLEEP). See the header comment above for why the two are kept apart. */
 typedef struct {
-    unsigned long sleep_requests;      /* times the duty cycle went idle */
-    double        scheduled_idle_s;    /* summed requested idle duration */
-    unsigned long light_sleep_entries; /* light sleeps the PM subsystem reported */
-    double        light_sleep_s;       /* summed ACTUAL light-sleep time */
-    bool          pm_configured;       /* esp_pm_configure() succeeded */
+    unsigned long sleep_requests;            /* times the duty cycle went idle */
+    double        scheduled_idle_s;          /* summed requested idle duration */
+    unsigned long light_sleep_entries;       /* total light sleeps observed */
+    double        light_sleep_s;             /* total ACTUAL light-sleep time */
+    unsigned long idle_light_sleep_entries;  /* subset during PM_SLEEP */
+    double        idle_light_sleep_s;        /* subset during PM_SLEEP */
+    bool          pm_configured;             /* esp_pm_configure() succeeded */
 } power_stats_t;
 
 /* The sleep mode selected by CONFIG_AS_SLEEP_MODE. */
@@ -121,6 +144,25 @@ pm_phase_t power_phase(void);
 
 /* Accumulated duty-cycle statistics since boot. */
 const power_stats_t *power_get_stats(void);
+
+/*
+ * Apply one observed light sleep to `stats`.
+ *
+ * The sleep is added to the totals always, and to the idle-phase counters only
+ * when `phase` is PM_SLEEP — i.e. when the duty cycle was in its scheduled idle
+ * window rather than in a sensor read, a conversion wait or a transmission.
+ * Pure C99 (host-tested in tests/test_power_stats.py) so the attribution rule is
+ * a tested property rather than a line inside a callback.
+ */
+void power_stats_note_light_sleep(power_stats_t *stats, double sleep_s,
+                                  pm_phase_t phase);
+
+/*
+ * idle_light_sleep_s / scheduled_idle_s, i.e. the fraction of the scheduled idle
+ * window the chip actually slept through. Returns 0 when nothing has been
+ * scheduled yet. Guaranteed <= 1 by construction; see power_stats.c.
+ */
+double power_stats_idle_sleep_ratio(const power_stats_t *stats);
 
 #ifdef __cplusplus
 }

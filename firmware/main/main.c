@@ -49,6 +49,10 @@
 #include "power_mgmt.h"
 #include "sensor.h"
 #include "sensor_supervisor.h"
+#include "power_stats.h"
+#if CONFIG_AS_USE_BH1750
+#include "sensor_bh1750.h"
+#endif
 
 static const char *TAG = "main";
 
@@ -89,9 +93,19 @@ static void log_periodic_stats(unsigned long cycle)
     communication_log_stats();
     ESP_LOGI(TAG,
              "duty cycle: idle_requests=%lu scheduled_idle=%.1fs "
-             "light_sleep_entries=%lu light_sleep=%.1fs",
+             "total_light_sleep_entries=%lu total_light_sleep=%.1fs "
+             "idle_light_sleep=%.1fs idle_sleep_ratio=%.2f",
              pw->sleep_requests, pw->scheduled_idle_s,
-             pw->light_sleep_entries, pw->light_sleep_s);
+             pw->light_sleep_entries, pw->light_sleep_s,
+             pw->idle_light_sleep_s,
+             power_stats_idle_sleep_ratio(pw));
+#if CONFIG_AS_USE_BH1750
+    unsigned bh_reads = 0, bh_failures = 0, bh_skips = 0, bh_events = 0;
+    sensor_bh1750_counters(&bh_reads, &bh_failures, &bh_skips, &bh_events);
+    ESP_LOGI(TAG,
+             "bh1750: reads=%u failures=%u skips=%u unavailable_events=%u",
+             bh_reads, bh_failures, bh_skips, bh_events);
+#endif
 }
 
 void app_main(void)

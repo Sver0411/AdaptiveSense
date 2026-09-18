@@ -26,6 +26,7 @@
 #include "freertos/task.h"
 
 #include "config.h"
+#include "power_stats.h"
 
 static const char *TAG = "pm";
 
@@ -48,8 +49,14 @@ static esp_err_t light_sleep_exit_cb(int64_t sleep_time_us, void *arg)
 {
     (void)arg;
     if (sleep_time_us > 0) {
-        g_stats.light_sleep_entries++;
-        g_stats.light_sleep_s += (double)sleep_time_us / 1e6;
+        /*
+         * The attribution rule lives in power_stats.c (pure C, host-tested): the
+         * sleep always reaches the totals, and reaches the idle counters only if
+         * the duty cycle was in its PM_SLEEP phase. This callback runs in idle
+         * task context and must not block, so it does nothing else.
+         */
+        power_stats_note_light_sleep(&g_stats, (double)sleep_time_us / 1e6,
+                                     g_phase);
     }
     return ESP_OK;
 }

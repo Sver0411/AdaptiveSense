@@ -9,8 +9,10 @@ because two of the claims are otherwise only checkable by unplugging the part:
     taking the temperature and humidity channels with it.
 
 Reference point for the conversion: in the first hardware session the module at
-0x23 answered with raw = 66, which is 55.0 lx. That is how the 1.2 divisor is
-anchored to real light rather than to a datasheet alone.
+0x23 answered with raw = 66, which the datasheet formula turns into 55.0 lx —
+plausible for the indoor conditions observed. That makes it a useful fixture, and
+a sanity check that the formula and the part agree; it is not a calibration,
+because no independent lux meter was used.
 """
 
 from __future__ import annotations
@@ -71,8 +73,10 @@ def test_darkness_reads_as_zero_not_as_an_error(bh1750_host):
 def test_the_module_s_reference_value_converts_correctly(bh1750_host):
     """raw 66 -> 55.0 lx.
 
-    This is the anchor: 66 is what the physical GY-302 returned in the first
-    hardware session, so the divisor is confirmed against real light.
+    The fixture: 66 is what the physical GY-302 returned in the first hardware
+    session, and the datasheet formula gives 55.0 lx for it - plausible for the
+    observed indoor conditions. This checks that formula and part agree; it is
+    not a calibration against an independent lux meter.
     """
     table = lux_table(bh1750_host)
     assert table[66] == pytest.approx(55.0, abs=1e-4)
