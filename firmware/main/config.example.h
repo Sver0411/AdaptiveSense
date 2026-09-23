@@ -132,6 +132,36 @@
 #define CONFIG_AS_BH1750_MEAS_TIME_MS 180
 
 /*
+ * Optional soil-moisture telemetry: an analog probe on an ADC1 pin, reported as
+ * raw counts + calibrated millivolts + a two-point relative index. Deliberately
+ * NOT a fifth adaptive channel: the ADC and its calibration are validated here
+ * first, and the channel only joins the algorithm (and the MQTT schema) in a
+ * later step if the evidence holds up.
+ *
+ * The GPIO must be an ADC1 pad (GPIO1-10 on the ESP32-S3): ADC2 cannot be used
+ * while Wi-Fi is active, and this node always has Wi-Fi on. The unit and channel
+ * are derived from the GPIO at runtime with adc_oneshot_io_to_channel(), never
+ * hardcoded.
+ *
+ *   attenuation 3 = ADC_ATTEN_DB_12, the widest range (~0-3.1 V measurable).
+ *   With the probe's VCC on the 3V3 rail its output cannot exceed 3.3 V, which
+ *   is inside the pin's absolute maximum; the ADC simply saturates in the last
+ *   ~0.2 V, and saturation is reported rather than hidden.
+ *
+ * Calibration endpoints (raw counts): either endpoint at 0 means incomplete -
+ * raw counts are still reported, millivolts only when ADC calibration succeeds,
+ * and the normalised index stays invalid. A historical dry reading is recorded
+ * in docs/hardware.md, but the current board's dry/wet response has not yielded
+ * a repeatable calibration, so neither endpoint is configured yet.
+ */
+#define CONFIG_AS_USE_SOIL_SENSOR       1
+#define CONFIG_AS_SOIL_ADC_GPIO         1
+#define CONFIG_AS_SOIL_ADC_ATTEN        3    /* ADC_ATTEN_DB_12 */
+#define CONFIG_AS_SOIL_SAMPLE_COUNT     16
+#define CONFIG_AS_SOIL_DRY_RAW          0
+#define CONFIG_AS_SOIL_WET_RAW          0
+
+/*
  * How many consecutive read failures it takes to conclude that a sensor which
  * WAS working has gone away, after which bring-up is re-attempted under the
  * rate limit in sensor_supervisor.c.

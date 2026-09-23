@@ -3,13 +3,34 @@
 Record of an **actual** `idf.py build` run for the ESP32-S3 target, with the
 exact toolchain and commands. Nothing in this file is inferred or estimated.
 
-> **Scope.** This page records a *compile/ link* verification only. No ESP32-S3
-> board was attached, no firmware was flashed, and no sensor or power
-> measurement was taken. See the *Hardware status* section of the README.
+> **Scope.** Build results verify compilation and linking. Board observations are
+> recorded separately in `hardware_test_log.md`; a build is not a sensor test.
 
 ---
 
-## Summary
+## Latest validation — 2026-09-23
+
+With ESP-IDF v5.4.4 exported, the current source was built in a **new, empty
+temporary build directory** using `idf.py -B <temporary-build-directory> build`.
+The source tree's existing `sdkconfig` selected `esp32s3`, consistent with
+`sdkconfig.defaults`. This is a cold build, independent of the existing
+`firmware/build` directory. It used the local ignored `main/config.h`; a fresh
+clone provisions that file from `config.example.h` and may produce a different
+binary size.
+
+| check | result |
+|---|---|
+| ESP-IDF build | PASS, 1071/1071 steps; zero `warning:` lines in the build log |
+| App binary | 920 448 B (`0xe0b80`), 12 % of the smallest app partition free |
+| ELF / bootloader | 10 075 436 B / 20 928 B |
+| Full host suite | 235 passed (`pytest -q tests`) |
+| Configuration parity | 69 checks passed (`scripts/check_config_parity.py`) |
+
+The board run and the uncalibrated soil ADC result are in
+`hardware_test_log.md`, session 8. Neither the build nor the host tests establish
+a usable wet calibration.
+
+## Historical validation — 2026-09-15
 
 | item | value |
 |------|-------|

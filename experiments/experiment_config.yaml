@@ -179,6 +179,26 @@ firmware:
   bh1750_i2c_addr: 0x23
   bh1750_meas_time_ms: 180
 
+  # Optional soil-moisture telemetry: an analog probe on an ADC1 pin, read as
+  # raw counts + calibrated millivolts + a two-point relative index. Firmware-
+  # only, and deliberately NOT a fifth adaptive channel: the ADC and its
+  # calibration are validated here first.
+  #
+  # dry_raw / wet_raw are proposed endpoints in raw counts. If either is 0,
+  # calibration is incomplete: raw counts are still reported, millivolts are
+  # reported only when ADC calibration succeeds, and the index stays invalid.
+  # See docs/hardware.md for the provisional dry measurement and open issues.
+  #
+  # soil_moisture_norm is a two-point RELATIVE index (0 = dry endpoint,
+  # 1 = wet endpoint), not volumetric water content and not an absolute
+  # soil-moisture percentage.
+  use_soil_sensor: 1
+  soil_adc_gpio: 1
+  soil_adc_atten: 3
+  soil_sample_count: 16
+  soil_dry_raw: 0
+  soil_wet_raw: 0
+
 
 # -------------------------------------------------------------
 # Evaluation configuration (metrics only, not used by the node)

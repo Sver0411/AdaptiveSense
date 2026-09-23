@@ -319,6 +319,7 @@ required of the **numeric** outputs only, and CI enforces that.
 | Sensor layer, both backends | **Verified** — host-tested protocol layer, and the SHT30 read on hardware (see the test log) |
 | BH1750 light sensor | **Verified** — real lux on the shared bus; an optional channel, so its failure invalidates only `light` |
 | Deep sleep | **Experimental, rejected at compile time** — it reboots, so the scheduling state would not survive |
+| Soil moisture ADC | **Experimental telemetry** — ADC counts and calibrated mV when available; the relative index remains `na` until both endpoints are validated. It is **not** volumetric water content |
 
 The firmware logs the policy decision (`upload_requested`) and the transport
 outcome (`publish_call_ok`) separately, and keeps counters for both, so a hardware

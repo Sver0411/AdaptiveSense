@@ -50,6 +50,9 @@
 #include "sensor.h"
 #include "sensor_supervisor.h"
 #include "power_stats.h"
+#if CONFIG_AS_USE_SOIL_SENSOR
+#include "soil_moisture.h"
+#endif
 #if CONFIG_AS_USE_BH1750
 #include "sensor_bh1750.h"
 #endif
@@ -71,6 +74,44 @@ static cd_config_t g_cd_cfg;
 static as_config_t g_sched_cfg;
 static cd_t g_detector;
 static as_t g_scheduler;
+
+#if CONFIG_AS_USE_SOIL_SENSOR
+/*
+ * The soil probe is hardware telemetry, deliberately outside the four adaptive
+ * channels: `g_values` / `g_valid` and the MQTT payload stay 4-channel until the
+ * ADC and its calibration have earned a place in the algorithm. Read and log
+ * once per scheduled cycle, including cycles where the primary sensor fails.
+ */
+static soil_moisture_reading_t g_soil;
+static bool g_soil_ready = false;
+static unsigned long g_soil_read_failures = 0;
+
+static void log_soil_reading(unsigned long cycle)
+{
+    char mv_str[16];
+    char norm_str[16];
+    char unclamped_str[16];
+    if (g_soil.voltage_valid) {
+        snprintf(mv_str, sizeof(mv_str), "%d", g_soil.millivolts);
+    } else {
+        snprintf(mv_str, sizeof(mv_str), "na");
+    }
+    if (g_soil.normalized_valid) {
+        snprintf(norm_str, sizeof(norm_str), "%.3f", (double)g_soil.normalized);
+        snprintf(unclamped_str, sizeof(unclamped_str), "%.3f",
+                 (double)g_soil.unclamped);
+    } else {
+        snprintf(norm_str, sizeof(norm_str), "na");
+        snprintf(unclamped_str, sizeof(unclamped_str), "na");
+    }
+    ESP_LOGI(TAG,
+             "soil: cycle=%lu raw=%d mv=%s norm=%s unclamped=%s "
+             "saturated=%d batch=[%d..%d] mean=%.1f std=%.2f n=%d",
+             cycle, g_soil.raw, mv_str, norm_str, unclamped_str,
+             (int)g_soil.saturated, g_soil.min, g_soil.max,
+             g_soil.mean, g_soil.std, g_soil.samples_taken);
+}
+#endif
 
 static float g_values[CD_NUM_CHANNELS];
 static bool  g_valid[CD_NUM_CHANNELS];
@@ -122,6 +163,18 @@ void app_main(void)
 
     policy_build_detector_config(&g_cd_cfg);
     policy_build_scheduler_config(&g_sched_cfg);
+
+#if CONFIG_AS_USE_SOIL_SENSOR
+    /*
+     * Soil telemetry arms itself here and is read once per sample below. Its
+     * failure is never fatal: a node that cannot read the probe still measures
+     * temperature, humidity and light.
+     */
+    g_soil_ready = soil_moisture_init() == 0;
+    if (!g_soil_ready) {
+        ESP_LOGW(TAG, "soil telemetry unavailable this boot");
+    }
+#endif
 
     /* Sensor bring-up is retried, not attempted once, and a live sensor that
      * stops answering is re-probed rather than logged as "ready" forever. */
@@ -191,6 +244,20 @@ void app_main(void)
         power_set_phase(PM_SAMPLE);
         sensor_read_t reading;
 
+#if CONFIG_AS_USE_SOIL_SENSOR
+        /* Independent telemetry: a failed SHT30 read must not suppress the ADC
+         * sample or cause an old soil value to be logged for this cycle. */
+        if (g_soil_ready) {
+            if (soil_moisture_read(&g_soil) == 0) {
+                log_soil_reading(cycle);
+            } else {
+                g_soil_read_failures++;
+                ESP_LOGW(TAG, "soil read failed at cycle %lu (%lu failures so far)",
+                         cycle, g_soil_read_failures);
+            }
+        }
+#endif
+
         if (!sensor_sup_ready(&sensor_sup)) {
             /* Case 1: unusable, waiting for the next bring-up attempt.
              *
@@ -231,6 +298,7 @@ void app_main(void)
 
         /* Case 3: a real measurement. */
         sensor_sup_note_read_success(&sensor_sup);
+
         memcpy(g_valid, reading.valid, sizeof(g_valid));
         for (int i = 0; i < CD_NUM_CHANNELS; i++) {
             g_values[i] = reading.value[i];

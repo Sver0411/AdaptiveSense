@@ -30,12 +30,13 @@ jobs:
       - name: Build for esp32s3
         shell: bash
         run: |
+          set -o pipefail
           . "$IDF_PATH/export.sh"
           cd firmware
           idf.py set-target esp32s3
           idf.py build 2>&1 | tee /tmp/build.log
           # Fail the job on any compiler warning from the project's own sources.
-          if grep -E "warning:" /tmp/build.log | grep -E "main/(main|sensor|bme280_math|change_detector|adaptive_scheduler|communication|power_mgmt|policy_config)\.[ch]"; then
+          if grep -E "warning:" /tmp/build.log | grep -E "main/.*\.[ch]"; then
             echo "::error::Compiler warnings in AdaptiveSense sources"
             exit 1
           fi

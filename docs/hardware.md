@@ -186,6 +186,86 @@ result in a 22-fractional-bit accumulator which an earlier revision of this
 project divided by 1024 instead of 4096, reporting humidity four thousand times
 too large. See [audit_v0.2.md](audit_v0.2.md), issues #1 and #1b.
 
+## Soil moisture ADC — hardware telemetry, not an adaptive channel
+
+An analog soil-moisture probe (AO output) is read on **GPIO1 = ADC1 channel 0**
+(the mapping is derived at runtime with `adc_oneshot_io_to_channel()`, never
+hardcoded). It is deliberately **outside** the four adaptive channels: no
+`SEN_CH_COUNT` change, no change-detector input, no MQTT field. The ADC and its
+calibration are validated first; whether soil ever joins the algorithm is a later
+decision.
+
+### Configuration and acquisition
+
+| | |
+|---|---|
+| GPIO / unit / channel | GPIO1 -> ADC1 ch0 (`CONFIG_AS_SOIL_ADC_GPIO`) |
+| attenuation | `ADC_ATTEN_DB_12` (`CONFIG_AS_SOIL_ADC_ATTEN = 3`) |
+| resolution | 12 bit (raw 0-4095, `ADC_BITWIDTH_DEFAULT`) |
+| samples per read | 16 (`CONFIG_AS_SOIL_SAMPLE_COUNT`) |
+| filter | median of the batch for n >= 5, else the mean |
+| calibration scheme | curve fitting (eFuse), `adc_cali` |
+| latency | N oneshot reads back to back, no inter-sample delay; well under 1 ms per read |
+
+Every scheduled cycle logs the **raw ADC count** and batch statistics (min / max /
+mean / std / n), even if the primary SHT30 read fails. Calibrated millivolts are
+logged when ADC voltage calibration succeeds; otherwise `mv=na`. The relative
+index and its unclamped value remain `na` until both moisture endpoints are
+validated. `saturated=1` marks a filtered raw value at either ADC limit. These
+fields are serial telemetry only, not MQTT data.
+
+### Electrical safety (recorded, with its limits)
+
+The probe's VCC is on the **3V3 rail** (confirmed on the board), so its AO — a
+divider output from its own supply — cannot exceed 3.3 V, which is inside the
+pin's absolute maximum. With 12 dB attenuation the ADC measures up to ~3.1 V, so
+the top ~0.2 V would saturate; that is a measurement limit, not a safety problem.
+
+**No independent measurement was taken**: no multimeter was available, so the AO
+voltage range is known from the ADC itself (calibrated millivolts), not from a
+separate instrument. The safety argument is constructional (3V3-supplied divider)
+plus the observation that the latest air batches stayed below full scale. An
+earlier near-ceiling reading shows that voltage headroom is a real measurement
+concern. An independent multimeter measurement of VCC and AO across air / wet /
+water remains an open item.
+
+### Calibration so far
+
+The two endpoints are configured as raw counts (`CONFIG_AS_SOIL_DRY_RAW` /
+`CONFIG_AS_SOIL_WET_RAW`). Both are currently **0 (unset)**. If either is unset,
+raw counts remain available, calibrated millivolts are reported when valid, and
+`norm=na`.
+
+| endpoint | condition | raw | voltage | evidence |
+|---|---|---|---|---|
+| historical air reading | probe in air | **3676** (prior batch means 3674-3680) | ~2916 mV | Earlier exploratory run; not accepted as a current calibration endpoint |
+| current air reading | probe in air after removing wet paper | **3770-3805** across three logged batches | ~2970-2988 mV | 2026-09-23 board run; see `hardware_test_log.md`, session 8 |
+| wet endpoint | **not accepted** | 0 (unset) | - | Wet paper gave inconsistent results and later overlapped the air range; a reproducible wet-soil test is needed |
+
+The earlier wet-paper placement gave near-ceiling counts (~3980-3997), but a
+repeat placement with the project firmware gave 3770-3802, inside the air range.
+That contrast is not repeatable, so it is not a calibration. `normalized_valid`
+remains false until valid endpoints exist.
+
+### Open-circuit behaviour (observed, not solved)
+
+With AO disconnected in an earlier test, the input floated toward ground:
+`raw=38, batch=[0..69]`. **ADC open-circuit cannot currently be reliably
+distinguished from a real analog value.** A pull-down, a resistor network or
+power-gating with presence detection would change that; none is implemented.
+The driver's ADC-limit flag does not fire for this case, because the filtered
+value is not at an endpoint. The wet/dry direction of this module is not yet
+established by a repeatable test.
+
+### What the normalised index is not
+
+`soil_moisture_norm` is a two-point relative index (0 = dry endpoint, 1 = wet
+endpoint). It is **not volumetric water content and not an absolute
+soil-moisture percentage**: soil type, probe geometry, contact, temperature and
+salinity all shift the transfer curve, and none of them are calibrated. The ADC's
+raw resolution (1 count) is likewise not the measurement accuracy — ADC
+non-linearity, noise and probe effects dominate it by orders of magnitude.
+
 ## Runtime bus wedge — a known limitation
 
 `sensor_bus.c` can release a wedged bus: it samples SDA/SCL as inputs and, if a

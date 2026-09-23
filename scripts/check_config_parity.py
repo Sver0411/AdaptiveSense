@@ -97,6 +97,12 @@ SPEC: Sequence[Tuple[str, str, str]] = (
     ("firmware.use_bh1750", "CONFIG_AS_USE_BH1750", "bool"),
     ("firmware.bh1750_i2c_addr", "CONFIG_AS_BH1750_I2C_ADDR", "int"),
     ("firmware.bh1750_meas_time_ms", "CONFIG_AS_BH1750_MEAS_TIME_MS", "int"),
+    ("firmware.use_soil_sensor", "CONFIG_AS_USE_SOIL_SENSOR", "bool"),
+    ("firmware.soil_adc_gpio", "CONFIG_AS_SOIL_ADC_GPIO", "int"),
+    ("firmware.soil_adc_atten", "CONFIG_AS_SOIL_ADC_ATTEN", "int"),
+    ("firmware.soil_sample_count", "CONFIG_AS_SOIL_SAMPLE_COUNT", "int"),
+    ("firmware.soil_dry_raw", "CONFIG_AS_SOIL_DRY_RAW", "int"),
+    ("firmware.soil_wet_raw", "CONFIG_AS_SOIL_WET_RAW", "int"),
 )
 
 REL_TOL = 1e-6

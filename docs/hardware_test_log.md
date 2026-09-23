@@ -1213,6 +1213,51 @@ measurement, which was not taken.
 
 ---
 
+## Session 8 — 2026-09-23, attached-device check and soil ADC follow-up
+
+The same ESP32-S3 board was connected over `/dev/cu.usbmodem5C930836161`.
+A temporary ESP-IDF diagnostic application was flashed to the app partition only
+after that partition was backed up. It probed the existing GPIO8/GPIO9 I2C bus
+and sampled GPIO1 through ADC1 channel 0. The original app image was restored
+and its boot checked before the revised AdaptiveSense build was flashed. The
+temporary diagnostic and backup files were removed after restoration.
+
+| check | observed result | limit of the result |
+|---|---|---|
+| I2C addresses | `0x23`, `0x3C`, `0x44` ACK; `0x3D`, `0x45`, `0x5C` absent | Confirms three responding devices on GPIO8/GPIO9. `0x3C` is consistent with the OLED previously identified, but this run did not draw to the display. |
+| SHT30 | `25.70 C`, `52.37 %RH` on the original app; readings continued after the revised app was flashed | Live temperature and humidity read. |
+| BH1750 | `147.5 lx` on the original app; light readings continued after the revised app was flashed | Live light read. |
+| ADC | GPIO1 mapped to ADC1 channel 0; curve-fitting calibration available | Confirms ADC acquisition, not a calibrated moisture measurement. |
+
+Before the timing of the first wet-paper placement was confirmed, the original
+app logged `raw=4095, mv=3123, batch=[4077..4095]`. After the owner reported
+the wet paper was wrapped around the probe, the diagnostic app read roughly
+`3979-3997` counts. The owner removed the wet paper, and the revised project
+firmware logged these air readings:
+
+```
+soil: cycle=1 raw=3786 mv=2978 norm=na unclamped=na saturated=0 batch=[3756..3827] mean=3790.3 std=19.01 n=16
+soil: cycle=2 raw=3770 mv=2970 norm=na unclamped=na saturated=0 batch=[3695..3813] mean=3770.6 std=29.25 n=16
+soil: cycle=4 raw=3805 mv=2988 norm=na unclamped=na saturated=0 batch=[3783..3839] mean=3809.1 std=13.51 n=16
+```
+
+After the owner wrapped wet paper around the sensing part again, the same
+firmware logged `raw=3802` at cycle 5 and `raw=3770` at cycle 6. These overlap
+the air readings. Wet paper did not give a repeatable wet endpoint, and the
+direction of the probe's response is not established. Both configured moisture
+endpoints are therefore unset (`0`); the firmware reports raw counts and valid
+millivolts while keeping `norm=na`. A wet-soil trial and an independent voltage
+measurement remain open. The owner did not have wet soil available in this
+session.
+
+This session also verified that the revised firmware emits a soil line on each
+scheduled cycle with `norm=na` and `unclamped=na`, rather than a misleading zero.
+The final 920 448 B app build (both endpoints unset) was flashed and verified.
+Its first cycle read SHT30, BH1750 and ADC without a boot error:
+`soil: cycle=1 raw=3789 mv=2981 norm=na unclamped=na saturated=0`.
+
+---
+
 ## Method notes
 
 Two things were needed to test at all from a scripted session, and both are

@@ -35,6 +35,8 @@ idf_component_register(
         "communication_payload.c"
         "power_mgmt.c"
         "power_stats.c"
+        "soil_moisture.c"
+        "soil_moisture_math.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_wifi
@@ -45,4 +47,5 @@ idf_component_register(
         driver
         esp_timer
         esp_pm
+        esp_adc
 )
