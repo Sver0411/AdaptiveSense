@@ -1,60 +1,34 @@
-# AdaptiveSense
+<h1 align="center">AdaptiveSense</h1>
 
-**Change-aware adaptive sampling for resource-constrained IoT nodes**
+<p align="center"><strong>Change-Aware Adaptive Sampling for IoT Nodes</strong></p>
 
-[![Python tests](https://github.com/Sver0411/AdaptiveSense/actions/workflows/python-tests.yml/badge.svg)](https://github.com/Sver0411/AdaptiveSense/actions/workflows/python-tests.yml)
-[![ESP-IDF build](https://github.com/Sver0411/AdaptiveSense/actions/workflows/esp-idf-build.yml/badge.svg)](https://github.com/Sver0411/AdaptiveSense/actions/workflows/esp-idf-build.yml)
-
-An ESP32-S3 / ESP-IDF research prototype that asks whether a *change-aware*
-sampling policy can cut sensing and communication cost on a battery-powered
-environmental node **without giving up event detection** — and that reports where
-the answer is "not entirely".
-
-The policy is implemented twice: an **offline replay simulator** (Python) that
-evaluates it against fixed-rate baselines on a labelled synthetic benchmark, and
-an **ESP32-S3 firmware** (ESP-IDF v5.4, C) that runs it on device. Both follow one
-written specification, and a test compiles the firmware's policy sources for the
-host and checks that the two agree decision by decision.
-
-[中文版 README](README_zh.md) · [Algorithm specification](docs/change_score_spec.md) · [Engineering audit](docs/audit_v0.2.md)
+<p align="center">Change Detection · Sampling Cost · Event Retention</p>
 
 ---
 
+<p align="center">
+  <a href="#project-overview">Overview</a> ·
+  <a href="#method-and-workflow">Method</a> ·
+  <a href="#implementation-and-hardware-status">Status</a> ·
+  <a href="#relationship-to-smart-agriculture-edge-ai">Related System</a> ·
+  <a href="README_zh.md">简体中文</a>
+</p>
+
+---
+
+<a id="project-overview"></a>
+
+AdaptiveSense studies **Change-Aware Adaptive Sampling** for resource-constrained IoT nodes. It adjusts sampling intervals and upload decisions as environmental signals change, measuring the tradeoff between sensing/communication cost and retained event information. The repository includes a Python replay simulator and an ESP32-S3 C implementation following the same [algorithm specification](docs/change_score_spec.md).
+
 ## Research question
 
-> Can change-aware adaptive sampling reduce sensing and communication overhead on
-> resource-constrained IoT devices while preserving event-detection performance?
+Can a node sample and transmit less while preserving event detection? Sparse observations save work during quiet periods, but a short event can occur entirely between samples. AdaptiveSense reports both the savings and the events its policy misses.
 
-## Why adaptive sampling
+## Method and workflow
 
-An environmental node that reports every second wastes energy whenever nothing is
-happening, which for an indoor room is most of the time. "Sample less and send
-less" is the obvious answer; the problem is that "less" is exactly what makes a
-node blind. With a fixed 60 s period, a 26 s disturbance can fall entirely between
-two samples — scenario E below does exactly that.
-
-A change-aware policy spends its budget where it is useful: rarely while the
-environment is quiet, quickly while something is happening. This repository
-measures how much that buys, and where it fails.
-
-## System
-
-```
-WAKE → READ SENSOR (through the sensor abstraction) → SCORE CHANGE
-     → ADAPTIVE POLICY (state, next interval, upload decision)
-     → PUBLISH over MQTT if requested → IDLE until the next sample
-```
-
-The sensor layer is an abstraction with two backends behind it. The build in this
-repository runs on an **SHT30**; the BME280 is the other supported backend, and
-which one is compiled in is a configuration choice — nothing above the sensor layer
-knows the difference.
-
-```
-sensor abstraction  (sensor.c: API, read contract, backend selection)
-├── SHT30 / SHT3x     temperature + humidity        <- this physical build
-└── BME280            temperature + humidity + pressure
-```
+1. **Score change.** For each valid channel, combine deviation from a persistent EMA baseline, windowed population standard deviation, and mean absolute rate of change. Normalize by that channel's noise floor; use the maximum channel score.
+2. **Adapt the interval.** A hysteretic `STABLE → ACTIVE → ALERT` state machine escalates immediately and de-escalates one level at a time. Interval ladders are STABLE `[20, 40, 60]` s, ACTIVE `[15, 10, 5]` s, ALERT `[5]` s.
+3. **Request uploads.** Send on the first sample, event onset, state/interval changes, heartbeat, or sufficient change since the last upload request. Online events require the score to exceed a threshold for a minimum duration.
 
 ```mermaid
 flowchart LR
@@ -77,272 +51,62 @@ flowchart LR
     end
 ```
 
-| layer | file | responsibility |
-|-------|------|----------------|
-| sensor | `sensor.c`, `sensor_backend.h`, `sensor_bus.c`, `sensor_supervisor.c`, `sensor_sht30.c`, `sht30_proto.c`, `sensor_bme280.c`, `bme280_math.c`, `sensor_bh1750.c`, `bh1750_proto.c` | sensor API and backend selection, shared I2C bus ownership, bring-up and recovery supervision, two chip backends (SHT30 / BME280) plus the optional light channel |
-| change detection | `change_detector.c` | normalised instability score + debounced event |
-| adaptive policy | `adaptive_scheduler.c` | state machine, interval ladder, upload decision |
-| communication | `communication.c`, `communication_payload.c` | Wi-Fi lifecycle, MQTT publish, payload format, publish counters |
-| power | `power_mgmt.c` | ESP-IDF power-management setup, idle, observed sleep statistics |
-| configuration | `policy_config.c`, `config_include.h` | `config.h` macros → runtime structs |
+The sensor abstraction supports SHT30 and BME280 backends plus an optional BH1750 light channel on a shared I²C bus. Policy code is independent of sensor/radio drivers. Python and host-compiled firmware policy sources are compared decision by decision; [experiment configuration](experiments/experiment_config.yaml) is checked against the firmware configuration.
 
-The sensor layer in detail — one abstraction, two backends:
+## Key findings: synthetic replay
 
-| file | responsibility |
-|------|----------------|
-| `sensor.c` | sensor API, read contract, backend selection, mock override |
-| `sensor.h` | the public read contract (`sensor_init` / `sensor_read`, per-channel validity) |
-| `sensor_backend.h` | the interface a chip backend implements |
-| `sensor_bus.c` | the single shared I2C bus: created once, owned here, never by a backend |
-| `sensor_supervisor.c` | bring-up and runtime-recovery supervision: when to retry, when a sensor that stopped answering is declared unavailable and re-probed |
-| `sensor_sht30.c` | SHT30 / SHT3x backend: binds the protocol to the real bus, sequences a measurement |
-| `sht30_proto.c` | SHT30 protocol in pure C: CRC-8, frame decoding, command sequencing |
-| `sensor_bme280.c` | BME280 backend: chip-id check, forced-mode register sequence |
-| `bme280_math.c` | BME280 calibration parsing and compensation maths (pure C) |
-| `sensor_bh1750.c` | optional light channel: BH1750 on the shared bus, its own small availability state |
-| `bh1750_proto.c` | BH1750 protocol in pure C: one-shot conversion, raw -> lux, and the availability policy |
+Seven scenarios contain 26,400 s of 1 Hz synthetic signal and 24 channel-level labels from 13 physical disturbances. Every strategy sees the same signal and independent ground truth. The shared offline detector scores **event information retained in sampled streams**, rather than the firmware's global `event_active` flag.
 
-The layers have no back-references to each other, and the policy holds no
-reference to any sensor or radio driver — which is what lets the same C files be
-compiled and run on a workstation for the parity tests.
+| Strategy | Samples | Uploads | Upload reduction | Detected / labels | Detection rate | Mean latency |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Fixed-5s | 5280 | 5280 | 80.0 % | 22/24 | 91.7 % | 12.3 s |
+| Fixed-10s | 2640 | 2640 | 90.0 % | 22/24 | 91.7 % | 17.3 s |
+| Fixed-20s | 1320 | 1320 | 95.0 % | 19/24 | 79.2 % | 35.9 s |
+| Fixed-40s | 660 | 660 | 97.5 % | 17/24 | 70.8 % | 62.9 s |
+| Fixed-60s | 440 | 440 | 98.3 % | 11/24 | 45.8 % | 111.7 s |
+| **AdaptiveSense** | **1178** | **768** | **97.1 %** | **18/24** | **75.0 %** | **41.2 s** |
 
-## Method
+Results are micro-aggregated, not averages of scenario rates. Upload reduction is relative to the 1 Hz source: `1 − application_uploads / source_samples`. It excludes Wi-Fi, TCP, MQTT keepalive and other radio overhead; it is not a measured radio-traffic or energy reduction.
 
-The normative definition is [docs/change_score_spec.md](docs/change_score_spec.md).
-In short:
+AdaptiveSense lies between Fixed-20s and Fixed-40s on this benchmark; it does not outperform the fixed-rate tradeoff curve. It misses 6 labels and produces 17 false-positive detections, of which 11 occur outside labeled events (false alarms). Five of those false alarms come from the noisy-stable scenario.
 
-1. **Per-channel instability score.** Three change indicators per sample, each
-   divided by that channel's noise floor: deviation from a persistent EMA baseline
-   (`dev`), population standard deviation over `variety_window_s` (`std`), and
-   **mean** `|dx/dt|` over `roc_window_s` (`roc`).
-   `score_c = max(dev, std, roc) / noise_floor_c`; the overall score is the
-   maximum over participating channels.
+Representative failures:
 
-2. **Three-state machine with hysteresis** (`STABLE → ACTIVE → ALERT`).
-   Escalation is immediate — a score far above the ACTIVE entry bound takes
-   STABLE straight to ALERT. De-escalation moves **one level at a time**, and only
-   after the score drops below the current state's retention bound, so an ALERT is
-   not abandoned (and the node does not fall back to its longest interval) while
-   change is still present.
+- **Short event (E):** a 26 s spike is missed at a 60 s interval; neither of its two labels is detected.
+- **Slow drift (G):** a +3 °C ramp over 30 minutes is missed by every strategy, including Fixed-5s. The 60 s EMA reference follows the trend before deviation reaches the threshold; an explicit trend term or slower reference is needed.
+- **Mixed workload (C):** the upward step is detected and the downward step is missed (2/4 labels). At long intervals, the baseline decay and 10 s debounce cannot be established from a single observation.
 
-3. **Interval ladders.** STABLE `[20, 40, 60]` s, ACTIVE `[15, 10, 5]` s,
-   ALERT `[5]` s: STABLE lengthens as nothing happens, ACTIVE shortens as soon as
-   something does.
+Full scenario counts and latency distributions: [metrics_all.csv](results/metrics_all.csv), [metrics_summary.csv](results/metrics_summary.csv), and [plots](results/plots/). Definitions and matching rules: [methodology](docs/methodology.md), [dataset guide](dataset/README.md), and [engineering audit](docs/audit_v0.2.md).
 
-4. **Upload policy.** Transmit on the first sample, on event onset, on a state
-   change, on an interval change, on a heartbeat, or when a channel has moved by
-   more than `delta_threshold` noise floors since the last upload request.
+## Implementation and hardware status
 
-5. **Events** are declared when the score stays above `event_threshold` for
-   `event_min_duration_s`.
+| Capability | Evidence and scope |
+| --- | --- |
+| Python simulator / C policy | Synthetic replay and host parity checks |
+| ESP32-S3 firmware | Built with ESP-IDF v5.4.4; physically flashed and run |
+| SHT30 temperature/humidity + BH1750 light | Physical readings reach the detector and scheduling policy |
+| BME280 / pressure | Driver host-tested; no fitted BME280 or physical validation |
+| Wi-Fi / MQTT | Multi-cycle hardware runs with a local broker; node/collector cross-checks |
+| Power management | Automatic light-sleep configuration and observed sleep statistics; no measured current or energy |
+| Deep sleep | Experimental and rejected at compile time because it loses scheduling state |
+| Soil-moisture ADC | Experimental raw/calibrated-voltage telemetry; not volumetric water content |
 
-Every value lives in
-[`experiments/experiment_config.yaml`](experiments/experiment_config.yaml) and is
-mirrored into [`firmware/main/config.example.h`](firmware/main/config.example.h);
-`scripts/check_config_parity.py` fails if the two disagree, and it runs in CI. No
-tuning value is hardcoded in any source file.
+The SHT30/BH1750 run verifies the implemented sensing path, not the synthetic detection rates. Firmware separates `upload_requested` from `publish_call_ok`; at MQTT QoS 0, the latter means client acceptance, not delivery confirmation. See [hardware sessions](docs/hardware_test_log.md), [hardware notes](docs/hardware.md), [build record](docs/build_validation.md), and [power management](docs/power_management.md).
 
-### On-device implementation notes
+## Quick start and reproduction
 
-- **BME280 in forced mode.** One bounded conversion per sample, with a status poll
-  and a hard timeout; the sensor is never left converting while the MCU sleeps.
-  Calibration parsing and compensation use the vendor's double-precision
-  equations, reproduced in `bme280_math.c` and unit-tested on the host.
-- **Sleeping goes through the ESP-IDF power manager.** The node idles with
-  `vTaskDelay()`; FreeRTOS tickless idle and `esp_pm_configure()` put the chip into
-  light sleep, and the Wi-Fi driver's PM locks take part in the decision. The
-  application never calls `esp_light_sleep_start()`. See
-  [docs/power_management.md](docs/power_management.md).
-- **AdaptiveSense is sensor-agnostic.** The sensor layer supports two backends
-  behind one interface and one shared I2C bus, selected by configuration: a
-  **BME280** (temperature, humidity, **pressure**) and an **SHT30/SHT3x**
-  (temperature, humidity). Nothing above the sensor layer — change detector,
-  scheduler, event logic, simulator — knows which is in use, because a backend
-  reports the channels it cannot measure as *invalid* and the detector already
-  ignores invalid channels. The physical build validated here runs an SHT30; the
-  published simulation results are unaffected by the choice.
-- **The light channel is real on hardware, and is optional.** A BH1750 / GY-302
-  on the shared bus provides `light`; on the physical build the SHT30 supplies
-  temperature and humidity, the BH1750 supplies light, and `pressure` stays
-  invalid because nothing on the board measures it. It is an *optional* channel,
-  not a third backend: if the light sensor fails or is unplugged only `light`
-  goes invalid and the measurement still succeeds, because a node that reports
-  temperature and humidity must not go dark over a channel it can do without.
-  An unavailable channel is still sent as `null` with an explicit `valid` map
-  rather than as a plausible `0`.
-- **The simulation light channel and the physical one are different things.** The
-  synthetic benchmark's light channel is generated signal, replayed by the
-  simulator; the numbers in [Simulation results](#simulation-results) say nothing
-  about the BH1750 and are not evidence for or against it. What the hardware
-  validates is that a real light channel reaches the detector and that the policy
-  reacts to it — not that the published detection rates hold on this sensor.
-
-## Experimental design
-
-Seven synthetic scenarios, 26 400 s of 1 Hz signal
-([dataset/README.md](dataset/README.md)):
-
-| id | scenario | duration | injected content | designed to expose |
-|----|----------|----------|------------------|--------------------|
-| A | stable | 2 h | nothing | cost when nothing happens |
-| B | sudden | 30 min | one abrupt +5 °C step, onset off every sampling grid | step detection and latency |
-| C | mixed | 2 h | sub-threshold wobble, step up, step down | a realistic mixed workload |
-| D | repeated | 1 h | 6 irregular steps + 2 light bursts | repeated detection, a second modality |
-| E | short event | 30 min | one **26 s** spike after 26 min of quiet | **a short event missed by a long interval** |
-| F | noisy stable | 20 min | nothing, noise ≈ 7× the configured temperature floor | **false positives under a mis-parameterised floor** |
-| G | slow drift | 1 h | +3 °C over 30 min, hold, return | **change slower than the baseline** |
-
-The benchmark contains **24 channel-level labels derived from 13 injected physical
-disturbances**. A single physical disturbance may create labels on more than one
-sensor channel, because the generator couples humidity to temperature; the
-generator prints both counts and `tests/test_events.py` asserts both.
-
-Every strategy is replayed over **the same** signal: fixed-rate baselines
-(Fixed-5s/10s/20s/40s/60s) and AdaptiveSense (MIN 5 s / DEFAULT 20 s / MAX 60 s).
-
-**The ground truth is independent of AdaptiveSense.** Labels are written by the
-dataset generator from its own noise-free driven signal, using an absolute
-per-channel rule, so the policy cannot influence what counts as an event; see
-[docs/methodology.md](docs/methodology.md).
-
-### What the detection numbers mean
-
-> Event-detection metrics in this benchmark evaluate **event information retained
-> in each sampled stream**, using a shared offline per-channel detector.
->
-> They are **not** direct accuracy measurements of the firmware's global
-> `event_active` flag. The firmware flag is used for online scheduling and upload
-> decisions; the offline detector exists so that every sampling strategy is scored
-> by the same mechanism.
->
-> The metric is therefore a *sampling-quality* metric — how much of the
-> environmental event structure survives in the samples a strategy chose to take —
-> which is the question this project is actually about. See
-> [docs/change_score_spec.md](docs/change_score_spec.md) for both quantities
-> defined side by side.
-
-Detection is scored by one-to-one, channel-aware matching: a detection matches at
-most one labelled event and vice versa; matched pairs give the latency
-(onset-to-onset, clamped at 0); leftovers on the label side are missed events, and
-leftovers on the detection side are false positives. Detection rate and latency for
-the headline table are **micro-aggregated** (pooled counts), never the mean of
-per-scenario rates.
-
-## Simulation results
-
-> **Synthetic simulation results** — produced by `analysis/analyze.py` on the
-> synthetic benchmark. These are not hardware measurements.
-
-### Overall, micro-aggregated over all seven scenarios
-
-| strategy | samples | uploads | application upload reduction | mean interval | labels | detected | missed | false positives | false alarms | detection rate | mean latency | p95 latency |
-|----------|--------:|--------:|-----------------------------:|--------------:|-------:|---------:|-------:|----------------:|-------------:|---------------:|-------------:|------------:|
-| Fixed-5s | 5280 | 5280 | 80.0 % | 5.0 s | 24 | 22 | 2 | 17 | 11 | 91.7 % | 12.3 s | 14.0 s |
-| Fixed-10s | 2640 | 2640 | 90.0 % | 10.0 s | 24 | 22 | 2 | 20 | 15 | 91.7 % | 17.3 s | 19.0 s |
-| Fixed-20s | 1320 | 1320 | 95.0 % | 20.0 s | 24 | 19 | 5 | 20 | 19 | 79.2 % | 35.9 s | 38.1 s |
-| Fixed-40s | 660 | 660 | 97.5 % | 40.0 s | 24 | 17 | 7 | 14 | 13 | 70.8 % | 62.9 s | 78.0 s |
-| Fixed-60s | 440 | 440 | 98.3 % | 60.0 s | 24 | 11 | 13 | 5 | 3 | 45.8 % | 111.7 s | 118.0 s |
-| **AdaptiveSense** | **1178** | **768** | **97.1 %** | **22.3 s** | **24** | **18** | **6** | **17** | **11** | **75.0 %** | **41.2 s** | **67.2 s** |
-
-**`application upload reduction` is an application-level metric, not a radio-traffic
-metric.** It is `1 − number_of_application_uploads / number_of_ground_truth_samples`,
-and it excludes everything the radio does on its own: Wi-Fi beacon reception, TCP
-ACKs, MQTT keepalive PINGREQ/PINGRESP, MQTT protocol overhead, reassociation and
-DHCP traffic. A node whose uploads drop by 97 % has **not** reduced total radio
-traffic by 97 % — the keepalive alone guarantees background traffic. The same
-qualification applies to `upload_energy_proxy`.
-
-`false alarms` counts the false positives that lie inside no same-channel labelled
-event. The rest are *redundant* detections: the policy saw one physical event as
-more than one rise/fall trigger, which is an artefact of matching a sampled stream
-against a continuous disturbance rather than a spurious alarm. Both numbers are in
-`results/metrics_all.csv`.
-
-Read as a trade-off, AdaptiveSense sits **between Fixed-20s and Fixed-40s**: 97.1 %
-upload reduction at 75.0 % detection, where Fixed-20s gets 95.0 % at 79.2 % and
-Fixed-40s 97.5 % at 70.8 %. On this benchmark the change-aware policy interpolates
-the fixed-rate trade-off curve rather than beating it.
-
-### Per scenario, AdaptiveSense
-
-| scenario | samples | uploads | labels | detected | missed | rate | mean latency |
-|----------|--------:|--------:|-------:|---------:|-------:|-----:|-------------:|
-| A stable | 122 | 120 | 0 | 0 | 0 | *N/A* | — |
-| B sudden | 115 | 44 | 2 | 2 | 0 | 100 % | 35.5 s |
-| C mixed | 239 | 166 | 4 | 2 | 2 | 50 % | 47.5 s |
-| D repeated | 389 | 137 | 14 | 14 | 0 | 100 % | 41.1 s |
-| E short event | 32 | 30 | 2 | 0 | 2 | 0 % | — |
-| F noisy stable | 219 | 211 | 0 | 0 | 0 | *N/A* | — |
-| G slow drift | 62 | 60 | 2 | 0 | 2 | 0 % | — |
-
-A scenario with no labelled event reports **N/A**, never 0 %. Five of
-AdaptiveSense's 11 false alarms come from scenario F, and every fixed strategy
-produces false alarms there too (1–6): the configured noise floor does not
-describe that scenario, and the policy is not the cause.
-
-### Where the policy loses
-
-* **E — a 26 s event at a 60 s interval: missed.** No policy acting only on
-  sampled observations can react to a change that lies between two samples. This is
-  a property of sampled sensing, not a tuning failure.
-* **G — slow drift: missed by every strategy, including Fixed-5s.** The deviation
-  indicator uses an EMA of time constant `baseline_tau_s = 60 s`. A ramp slower
-  than that constant has a steady-state deviation of only `rate × tau`, which never
-  reaches the event threshold, so a 3 °C drift over 30 minutes is invisible to the
-  score as specified. Detecting drift needs a slower reference or an explicit trend
-  term — future work, not a parameter tweak.
-* **C — the downward step is missed while the upward step is detected.** A step
-  observed at a 60 s interval stays above the threshold for roughly one sampling
-  period, because the baseline half-catches-up within `baseline_tau_s`; with
-  `event_min_duration_s = 10 s` the debounce cannot be satisfied from a single
-  observation. The debounce duration, the baseline time constant and the sampling
-  interval are coupled, and the current values do not satisfy that coupling.
-
-Full numbers: [`results/metrics_all.csv`](results/metrics_all.csv) (per scenario)
-and [`results/metrics_summary.csv`](results/metrics_summary.csv) (overall).
-Figures: `results/plots/`. The pipeline regenerates the figures and CI checks they
-were produced; PNG bytes depend on the plotting library build, so byte-identity is
-required of the **numeric** outputs only, and CI enforces that.
-
-## Hardware status
-
-| item | status |
-|------|--------|
-| ESP-IDF build | **Verified** — `idf.py set-target esp32s3 && idf.py build`, ESP-IDF v5.4.4, 0 warnings ([record](docs/build_validation.md)) |
-| Python / C policy parity | **Verified** — firmware policy sources compiled for the host and compared sample by sample |
-| Synthetic evaluation | **Verified** — numeric outputs reproduce byte for byte |
-| Power-management configuration | **Verified in the build** — `CONFIG_PM_ENABLE=y`, tickless idle, light-sleep callbacks; the active sleep mode is logged at boot |
-| **ESP32-S3 physical flash / run** | **Verified** — see `docs/hardware_test_log.md` (sessions 1-7) |
-| **BME280 physical sensor validation** | `Not measured yet.` — no BME280 is fitted to the board; the driver is host-tested and the chip-id check is written, but it has never seen the part |
-| **Wi-Fi / MQTT multi-cycle hardware run** | **Verified** — multi-cycle runs over a phone hotspot with a local broker; node publishes cross-checked against the collector |
-| **Power measurement** | `Not measured yet.` — no INA219 / Joulescope / Power Profiler run |
-| Sensor layer, both backends | **Verified** — host-tested protocol layer, and the SHT30 read on hardware (see the test log) |
-| BH1750 light sensor | **Verified** — real lux on the shared bus; an optional channel, so its failure invalidates only `light` |
-| Deep sleep | **Experimental, rejected at compile time** — it reboots, so the scheduling state would not survive |
-| Soil moisture ADC | **Experimental telemetry** — ADC counts and calibrated mV when available; the relative index remains `na` until both endpoints are validated. It is **not** volumetric water content |
-
-The firmware logs the policy decision (`upload_requested`) and the transport
-outcome (`publish_call_ok`) separately, and keeps counters for both, so a hardware
-campaign can distinguish "the policy wanted to send" from "the MQTT client took
-it". Note that at QoS 0 `publish_call_ok` means *the client accepted the request*,
-not that the broker received or delivered the packet.
-
-## Reproduction
-
-Requirements: Python 3.10+; ESP-IDF v5.4 for the firmware; a C compiler for the
-host-side tests.
+Requirements: Python 3.10+, a C compiler for host checks, and ESP-IDF v5.4 for firmware.
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-
-python dataset/generate_dataset.py          # raw signals + independent labels
-python -m pytest tests/ -v                  # unit, matching, statistics, host-side C
-python scripts/check_config_parity.py       # YAML <-> firmware config.h
-python analysis/analyze.py                  # metrics + figures
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python dataset/generate_dataset.py
+python scripts/check_config_parity.py
+python analysis/analyze.py
 ```
 
-Firmware:
+Firmware, from an ESP-IDF shell:
 
 ```bash
 cd firmware
@@ -350,84 +114,19 @@ idf.py set-target esp32s3
 idf.py build
 ```
 
-No credentials are needed to build: `firmware/main/CMakeLists.txt` provisions the
-git-ignored `config.h` from the committed example.
+The build provisions the ignored `config.h` from its committed example; credentials are not needed to build. Optional host checks: `python -m pytest tests/ -v`. Real-data collection follows the [experiment protocol](docs/experiment_protocol.md).
 
-The generator is seeded and the analysis has no randomness, so the committed
-numeric results are exactly what the pipeline produces. CI enforces this with
-`git diff --exit-code -- 'dataset/**/*.csv' 'results/**/*.csv'`.
+## Relationship to Smart-Agriculture-Edge-AI
 
-## Limitations
+[Smart-Agriculture-Edge-AI](https://github.com/Sver0411/Smart-Agriculture-Edge-AI) reuses AdaptiveSense's sampling and change-detection implementation. AdaptiveSense remains an independent policy study; its synthetic metrics and standalone device runs are separate from the main system's evidence.
 
-1. **Simulation results on synthetic data.** Indicative, not measurements; 24
-   channel-level labels over 26 400 s is a small benchmark.
-2. **One environment family and a single node.** Indoor-like temperature,
-   humidity, pressure and light; generalisation is untested.
-3. **Physical modalities cover temperature, humidity and light.** The board
-   carries an SHT30 and a BH1750; `pressure` is not validated on hardware because
-   no BME280 is fitted, so the driver is host-tested only. The simulator still
-   models all three synthetic channels independently of what the board has.
-4. **No hardware energy measurement.** All cost figures are counts and a
-   dimensionless proxy.
-5. **A runtime I2C bus wedge has no automatic recovery.** The bus-recovery
-   procedure in `sensor_bus.c` runs only when the bus is created (boot), not
-   mid-run; a slave that holds SDA/SCL low while the node is running would need a
-   re-probe cycle that has not been designed or tested. Observed once and released
-   by hand; see `docs/hardware.md`.
-6. **A change-aware policy cannot react before a change has been sampled.** If no
-   sample lands inside a short event, nothing that relies on sampled observations
-   alone can detect it (scenario E).
-7. **Parameters are hand-selected and known not to be jointly optimal.**
-   `event_min_duration_s` (10 s) is not comfortably smaller than `baseline_tau_s`
-   (60 s), so a step observed at a 60 s interval cannot satisfy the debounce before
-   the deviation decays (scenario C). The values were left as they were configured
-   rather than tuned to improve the published numbers.
-8. **No comparison against more advanced adaptive-sampling algorithms**
-   (change-point detection, Bayesian or information-theoretic schemes,
-   learning-based predictors).
-9. **"Detection" means the score crossed a threshold for long enough**, not that a
-   change point was located: the detector is a threshold-and-debounce rule.
-10. **`publish_call_ok` is not delivery confirmation.** It reports that the MQTT
-   client accepted the request (QoS 0). End-to-end confirmation would need QoS 1,
-   `MQTT_EVENT_PUBLISHED` and server-side receipt validation.
+## Limitations and future work
 
-## Future work
-
-- **A real-world dataset** collected from the node itself
-  ([docs/experiment_protocol.md](docs/experiment_protocol.md)).
-- **Hardware energy measurement** (INA219 / Joulescope / Nordic Power Profiler) to
-  replace the proxy with joules and to validate the light-sleep duty cycle.
-- **A drift-sensitive indicator** — a slower baseline or an explicit trend term —
-  so the scenario-G class of change is detectable at all.
-- **Joint parameter selection** for `event_min_duration_s`, `baseline_tau_s` and
-  the ladders, with the coupling above treated explicitly.
-- **Delivery confirmation** via QoS 1 + `MQTT_EVENT_PUBLISHED` + server-side
-  receipt validation.
-- ~~BH1750 support~~ — done: the light channel is real on hardware (session 7),
-  so the on-device build is already multi-modal. What remains is a BME280 build,
-  which needs the part on the board.
-- **Comparison against advanced adaptive sampling / change-point detection**, and
-  the exploratory directions (a TinyML predictor, LoRa transport, multi-node
-  correlation). *None of these are implemented here.*
-
-## Repository layout
-
-```
-AdaptiveSense/
-├── firmware/       ESP-IDF C application (ESP32-S3)
-├── simulator/      offline replay simulator + normative scoring
-├── dataset/        synthetic generator, raw signals, independent labels
-├── experiments/    central experiment configuration (YAML)
-├── analysis/       metrics tables and figures
-├── scripts/        configuration parity check
-├── tests/          unit tests + host-side C test harnesses
-├── results/        simulation outputs (metrics + plots)
-└── docs/           specification, methodology, audit, engineering notes
-```
+- One small synthetic benchmark and hand-selected parameters do not establish performance in agriculture or other environments. Advanced adaptive-sampling baselines have not been compared.
+- Sparse sampling, baseline adaptation, and debounce jointly cause missed events; joint parameter selection and drift-sensitive scoring remain research priorities.
+- A runtime I²C bus wedge has no automatic bus recovery; the recovery procedure runs at bus creation. This was observed and released manually.
+- Cost figures are counts and dimensionless proxies. Hardware current/energy measurements, longer real-data evaluation, and end-to-end delivery confirmation remain pending.
 
 ## License
 
-AdaptiveSense is [MIT](LICENSE). `firmware/main/bme280_math.c` reproduces the
-compensation equations of Bosch Sensortec's `BME280_SensorAPI` under
-**BSD-3-Clause**; the full notice is in
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and at the top of that file.
+AdaptiveSense is [MIT](LICENSE). `firmware/main/bme280_math.c` reproduces Bosch Sensortec's `BME280_SensorAPI` compensation equations under **BSD-3-Clause**; attribution is preserved in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and the source file.
