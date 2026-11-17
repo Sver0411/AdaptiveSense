@@ -73,7 +73,7 @@ AdaptiveSense lies between Fixed-20s and Fixed-40s on this benchmark; it does no
 Representative failures:
 
 - **Short event (E):** a 26 s spike is missed at a 60 s interval; neither of its two labels is detected.
-- **Slow drift (G):** a +3 °C ramp over 30 minutes is missed by every strategy, including Fixed-5s. The 60 s EMA reference follows the trend before deviation reaches the threshold; an explicit trend term or slower reference is needed.
+- **Slow drift (G):** a +3 °C ramp over 30 minutes is missed under the pure 60 s EMA baseline (including Fixed-5s) because the short EMA tracks the slow ramp before deviation reaches the threshold. Enabling the two-sided CUSUM slow-drift accumulator (`cd_enable_cusum` in C / `ChangeAnalyzer.enable_cusum()` in Python) retains long-horizon cumulative drift against the initial anchor and reliably detects Scenario G.
 - **Mixed workload (C):** the upward step is detected and the downward step is missed (2/4 labels). At long intervals, the baseline decay and 10 s debounce cannot be established from a single observation.
 
 Full scenario counts and latency distributions: [metrics_all.csv](results/metrics_all.csv), [metrics_summary.csv](results/metrics_summary.csv), and [plots](results/plots/). Definitions and matching rules: [methodology](docs/methodology.md), [dataset guide](dataset/README.md), and [engineering audit](docs/audit_v0.2.md).

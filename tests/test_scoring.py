@@ -220,3 +220,16 @@ def test_event_resets_when_the_score_falls_below_the_threshold():
     assert an.event_active
     an.update(30.0, {"temperature": 24.0})   # dev has decayed to ~1.6 -> reset
     assert not an.event_active
+
+
+def test_cusum_detects_30_minute_slow_drift_ramp():
+    """A +3 degC ramp over 1800 s (Scenario G) is missed by 60 s EMA alone,
+    and detected once two-sided CUSUM accumulation is enabled."""
+    points = [(float(t), 24.0 + 3.0 * (t / 1800.0)) for t in range(0, 1801, 20)]
+    baseline_only = analyzer(tau=60.0, threshold=8.0, duration=10.0, noise=0.15)
+    assert not any(ev for _, _, ev in feed(baseline_only, points))
+
+    with_cusum = analyzer(tau=60.0, threshold=8.0, duration=10.0, noise=0.15)
+    with_cusum.enable_cusum(slack_factor=1.5)
+    assert any(ev for _, _, ev in feed(with_cusum, points))
+

@@ -87,10 +87,19 @@ typedef struct {
     double event_potential_start; /* < 0 when not tracking */
     bool   event_active;
     bool   hist_truncated;        /* set if the window ever needed more slots */
+
+    bool   cusum_enabled;
+    float  cusum_slack_factor;
+    float  cusum_anchor[CD_NUM_CHANNELS];
+    float  cusum_pos[CD_NUM_CHANNELS];
+    float  cusum_neg[CD_NUM_CHANNELS];
 } cd_t;
 
 /* Initialise the detector with a validated configuration. */
 void cd_init(cd_t *d, const cd_config_t *cfg);
+
+/* Enable two-sided CUSUM accumulation for slow-drift detection (Scenario G). */
+void cd_enable_cusum(cd_t *d, float slack_factor);
 
 /*
  * Feed one measurement vector.

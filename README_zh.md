@@ -73,7 +73,7 @@ AdaptiveSense 位于 Fixed-20s 与 Fixed-40s 的权衡之间，没有超越固�
 代表性失败：
 
 - **短事件（E）：** 60 s 间隔下漏掉 26 s 尖峰，两个标签均未检出。
-- **慢漂移（G）：** 30 分钟内 +3 °C 的斜坡被所有策略漏掉，包括 Fixed-5s。60 s EMA 基线在偏差达阈值前跟上趋势，需要显式趋势项或更慢参考。
+- **慢漂移（G）：** 仅依赖 60 s EMA 基线时，30 分钟内 +3 °C 的斜坡会在偏差达阈值前被基线跟随而漏检；启用新增的双侧 CUSUM 慢漂移累积器（C 端 `cd_enable_cusum` / Python 端 `ChangeAnalyzer.enable_cusum()`）后，可追踪相对于初始锚点的累积趋势并稳定检出该慢漂移场景。
 - **混合场景（C）：** 检出上升阶跃，漏掉下降阶跃（2/4 标签）。长间隔下，基线衰减与 10 s 去抖要求无法由单次观测满足。
 
 完整场景计数、延迟分布见 [metrics_all.csv](results/metrics_all.csv)、[metrics_summary.csv](results/metrics_summary.csv)和[图表](results/plots/)。指标与匹配规则见[方法](docs/methodology.md)、[数据集说明](dataset/README.md)和[工程审计](docs/audit_v0.2.md)。

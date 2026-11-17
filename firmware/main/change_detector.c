@@ -126,7 +126,18 @@ static float ema_update(cd_t *d, int ch, double t, float value)
         d->ema_valid[ch] = true;
         d->last_t[ch] = t;
         d->has_last[ch] = true;
+        d->cusum_anchor[ch] = value;
         return value;
+    }
+
+    if (d->cusum_enabled) {
+        const float noise = d->cfg->channels[ch].noise_floor;
+        const float slack = d->cusum_slack_factor * (noise > 0.0f ? noise : 1.0f);
+        const float diff = value - d->cusum_anchor[ch];
+        const float p = d->cusum_pos[ch] + diff - slack;
+        const float n = d->cusum_neg[ch] - diff - slack;
+        d->cusum_pos[ch] = (p > 0.0f) ? p : 0.0f;
+        d->cusum_neg[ch] = (n > 0.0f) ? n : 0.0f;
     }
 
     const double dt = (t > d->last_t[ch]) ? (t - d->last_t[ch]) : 0.0;
@@ -154,7 +165,26 @@ static float channel_score(const cd_t *d, int ch, float value, float ref)
     if (roc > m) {
         m = roc;
     }
+    if (d->cusum_enabled) {
+        const float c = (d->cusum_pos[ch] > d->cusum_neg[ch])
+                            ? d->cusum_pos[ch]
+                            : d->cusum_neg[ch];
+        if (c > m) {
+            m = c;
+        }
+    }
     return m / noise;
+}
+
+void cd_enable_cusum(cd_t *d, float slack_factor)
+{
+    if (d == NULL || slack_factor < 0.0f) {
+        return;
+    }
+    d->cusum_enabled = true;
+    d->cusum_slack_factor = slack_factor;
+    memset(d->cusum_pos, 0, sizeof(d->cusum_pos));
+    memset(d->cusum_neg, 0, sizeof(d->cusum_neg));
 }
 
 /* ------------------------------------------------------------------ */

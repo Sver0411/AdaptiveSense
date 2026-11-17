@@ -72,9 +72,24 @@ class ChangeAnalyzer:
         }
         self._ema: Dict[str, Optional[float]] = {name: None for name in self._cfs}
         self._last_t: Dict[str, Optional[float]] = {name: None for name in self._cfs}
+        self._cusum_enabled: bool = False
+        self._cusum_slack_factor: float = 0.25
+        self._cusum_anchor: Dict[str, Optional[float]] = {name: None for name in self._cfs}
+        self._cusum_pos: Dict[str, float] = {name: 0.0 for name in self._cfs}
+        self._cusum_neg: Dict[str, float] = {name: 0.0 for name in self._cfs}
         # event debounce (§5)
         self._potential_start: Optional[float] = None
         self.event_active: bool = False
+
+    def enable_cusum(self, slack_factor: float = 0.25) -> None:
+        """Enable two-sided CUSUM slow-drift accumulation."""
+        if slack_factor < 0.0:
+            raise ValueError("slack_factor must be non-negative")
+        self._cusum_enabled = True
+        self._cusum_slack_factor = slack_factor
+        for name in self._cfs:
+            self._cusum_pos[name] = 0.0
+            self._cusum_neg[name] = 0.0
 
     # ------------------------------------------------------------------ #
     # internals
@@ -119,7 +134,17 @@ class ChangeAnalyzer:
         if ema is None:
             self._ema[name] = value
             self._last_t[name] = t
+            self._cusum_anchor[name] = value
             return value
+        if self._cusum_enabled:
+            anchor = self._cusum_anchor[name]
+            if anchor is None:
+                anchor = value
+                self._cusum_anchor[name] = value
+            slack = self._cusum_slack_factor * self._cfs[name].noise_floor
+            diff = value - anchor
+            self._cusum_pos[name] = max(0.0, self._cusum_pos[name] + diff - slack)
+            self._cusum_neg[name] = max(0.0, self._cusum_neg[name] - diff - slack)
         dt = (t - last_t) if (last_t is not None and t > last_t) else 0.0
         alpha = dt / (dt + self.cfg.baseline_tau_s) if dt > 0.0 else 0.0
         ref = ema
@@ -155,7 +180,12 @@ class ChangeAnalyzer:
             dev = abs(value - ref)
             std = self._std(name)
             roc = self._roc(name, t)
-            score = max(dev, std, roc) / cf.noise_floor
+            cusum = (
+                max(self._cusum_pos[name], self._cusum_neg[name])
+                if self._cusum_enabled
+                else 0.0
+            )
+            score = max(dev, std, roc, cusum) / cf.noise_floor
             channel_scores[name] = score
             if score > overall:
                 overall = score
