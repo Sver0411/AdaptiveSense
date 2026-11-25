@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: >-
+  If you use or discuss AdaptiveSense in academic or technical work, please cite this
+  repository.
+type: software
+title: "AdaptiveSense: Change-Aware Adaptive Sampling on ESP32-S3"
+authors:
+  - name: Sver0411
+version: 0.2.0
+date-released: '2026-11-25'
+license: MIT
+repository-code: https://github.com/Sver0411/AdaptiveSense
+keywords:
+  - adaptive-sampling
+  - esp32-s3
+  - iot
+  - edge-computing
