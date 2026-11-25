@@ -130,3 +130,18 @@ The build provisions the ignored `config.h` from its committed example; credenti
 ## License
 
 AdaptiveSense is [MIT](LICENSE). `firmware/main/bme280_math.c` reproduces Bosch Sensortec's `BME280_SensorAPI` compensation equations under **BSD-3-Clause**; attribution is preserved in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and the source file.
+
+## Key Benchmark Figures
+
+![Accuracy vs. Efficiency Trade-off](results/plots/accuracy_efficiency_tradeoff.png)
+
+![Application Upload Reduction](results/plots/application_upload_reduction.png)
+
+## Part of the 4-Layer AIoT Research Stack
+
+`AdaptiveSense` belongs to **L2 · Adaptive Observation** of a reproducible AIoT systems stack:
+
+- **L1 · Reliable Sensing:** [SensorTrust](https://github.com/Sver0411/SensorTrust) (C11 zero-allocation sensor health monitoring)
+- **L2 · Adaptive Observation:** [AdaptiveSense](https://github.com/Sver0411/AdaptiveSense) · [TAIS](https://github.com/Sver0411/TAIS) (closed-loop trust-aware scheduling & boundary analysis)
+- **L3 · Freshness & Lossy Links:** [EventGuard-LoRa](https://github.com/Sver0411/EventGuard-LoRa) · [NetAdapt-IoT](https://github.com/Sver0411/NetAdapt-IoT) · [IoT-MPQUIC-Scheduler](https://github.com/Sver0411/IoT-MPQUIC-Scheduler)
+- **L4 · Resilience & CPS Validation:** [EdgeFaultLab](https://github.com/Sver0411/EdgeFaultLab) · [TinyEdgeBench](https://github.com/Sver0411/TinyEdgeBench) · [Smart-Agriculture-Edge-AI](https://github.com/Sver0411/Smart-Agriculture-Edge-AI) · [AgriTwin-CPS](https://github.com/Sver0411/AgriTwin-CPS)
